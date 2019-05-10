@@ -20,7 +20,7 @@ import scala.concurrent.Future
  * Implemented by [[DefaultProducerStage]] and [[TransactionalProducerStage]].
  */
 @InternalApi
-private[internal] trait ProducerStage[K, V, P, IN <: Envelope[K, V, P], OUT <: Results[K, V, P]] {
+private[internal] trait ProducerStage[K, V, P, IN <: Envelope[K, V, P], OUT <: Results[K, V, P], S] {
   val settings: ProducerSettings[K, V]
 
   val in: Inlet[IN] = Inlet[IN]("messages")

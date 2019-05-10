@@ -28,7 +28,7 @@ import scala.jdk.CollectionConverters._
 private[kafka] final class TransactionalProducerStage[K, V, P](
     val settings: ProducerSettings[K, V]
 ) extends GraphStage[FlowShape[Envelope[K, V, P], Future[Results[K, V, P]]]]
-    with ProducerStage[K, V, P, Envelope[K, V, P], Results[K, V, P]] {
+    with ProducerStage[K, V, P, Envelope[K, V, P], Results[K, V, P], String] {
 
   override def createLogic(inheritedAttributes: Attributes): GraphStageLogic =
     new TransactionalProducerStageLogic(this, inheritedAttributes)
@@ -105,6 +105,9 @@ private final class TransactionalProducerStageLogic[K, V, P](
 
   import TransactionalProducerStage._
 
+  override protected var producer: Producer[K, V] = _
+  private var initiated: Boolean = _
+
   private val commitSchedulerKey = "commit"
   private val messageDrainInterval = 10.milliseconds
 
@@ -114,14 +117,17 @@ private final class TransactionalProducerStageLogic[K, V, P](
 
   override protected def logSource: Class[_] = classOf[TransactionalProducerStage[_, _, _]]
 
-  override def preStart(): Unit = super.preStart()
+  override def preStart(): Unit = {
+    initiated = false
+    resumeDemand(tryToPull = false)
+    scheduleOnce(commitSchedulerKey, commitInterval)
+  }
 
   override protected def assignProducer(p: Producer[K, V]): Unit = {
     producer = p
     initTransactions()
     beginTransaction()
     resumeDemand()
-    scheduleOnce(commitSchedulerKey, stage.settings.eosCommitInterval)
   }
 
   // suspend demand until a Producer has been created
@@ -155,6 +161,20 @@ private final class TransactionalProducerStageLogic[K, V, P](
     }
   }
 
+  override def preSend(msg: Envelope[K, V, P]): Unit =
+    if (!initiated) {
+      msg.passThrough match {
+        case committedMarker: PartitionOffsetCommittedMarker if committedMarker.fromPartitionedSource =>
+          val gtp = committedMarker.key
+          producer = producerProvider(s"$transactionalId-${gtp.groupId}-${gtp.topic}-${gtp.partition}")
+        case _ =>
+          producer = producerProvider(transactionalId)
+      }
+      initTransactions()
+      beginTransaction()
+      initiated = true
+    }
+
   override def postSend(msg: Envelope[K, V, P]): Unit = msg.passThrough match {
     case o: ConsumerMessage.PartitionOffsetCommittedMarker => batchOffsets = batchOffsets.updated(o)
   }
@@ -175,11 +195,17 @@ private final class TransactionalProducerStageLogic[K, V, P](
 
   private def commitTransaction(batch: NonemptyTransactionBatch, beginNewTransaction: Boolean): Unit = {
     val group = batch.group
-    log.debug("Committing transaction for consumer group '{}' with offsets: {}", group, batch.offsets)
+    log.debug("Committing transaction for transactional id '{}' consumer group '{}' with offsets: {}",
+              transactionalId,
+              group,
+              batch.offsets)
     val offsetMap = batch.offsetMap()
     producer.sendOffsetsToTransaction(offsetMap.asJava, group)
     producer.commitTransaction()
-    log.debug("Committed transaction for consumer group '{}' with offsets: {}", group, batch.offsets)
+    log.debug("Committed transaction for transactional id '{}' consumer group '{}' with offsets: {}",
+              transactionalId,
+              group,
+              batch.offsets)
     batchOffsets = TransactionBatch.empty
     batch
       .internalCommit()
@@ -210,6 +236,6 @@ private final class TransactionalProducerStageLogic[K, V, P](
 
   private def abortTransaction(): Unit = {
     log.debug("Aborting transaction")
-    producer.abortTransaction()
+    Option(producer).foreach(_.abortTransaction())
   }
 }

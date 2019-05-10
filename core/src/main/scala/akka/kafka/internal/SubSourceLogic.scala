@@ -13,6 +13,7 @@ import akka.kafka.Subscriptions.{TopicSubscription, TopicSubscriptionPattern}
 import akka.kafka.internal.KafkaConsumerActor.Internal.RegisterSubStage
 import akka.kafka.{AutoSubscription, ConsumerFailed, ConsumerSettings}
 import akka.kafka.scaladsl.Consumer.Control
+import akka.kafka.scaladsl.PartitionAssignmentHandler
 import akka.pattern.{ask, AskTimeoutException}
 import akka.stream.scaladsl.Source
 import akka.stream.stage.GraphStageLogic.StageActor
@@ -31,19 +32,24 @@ import scala.util.{Failure, Success}
 /**
  * Internal API.
  *
- * Anonymous sub-class instance is created in [[CommittableSubSource]].
+ * Anonymous sub-class instance is created in [[CommittableSubSource]], [[PlainSubSource]] and [[TransactionalSubSource]].
  */
 @InternalApi
-private abstract class SubSourceLogic[K, V, Msg](
+private class SubSourceLogic[K, V, Msg](
     val shape: SourceShape[(TopicPartition, Source[Msg, NotUsed])],
     settings: ConsumerSettings[K, V],
     subscription: AutoSubscription,
     getOffsetsOnAssign: Option[Set[TopicPartition] => Future[Map[TopicPartition, Long]]] = None,
-    onRevoke: Set[TopicPartition] => Unit = _ => ()
+    onRevoke: Set[TopicPartition] => Unit = _ => (),
+    msgSourceLogicFactory: (SourceShape[Msg],
+                            TopicPartition,
+                            ActorRef,
+                            AsyncCallback[(TopicPartition, (Control, ActorRef))],
+                            AsyncCallback[(TopicPartition, Option[ConsumerRecord[K, V]])],
+                            Int) => MessageSubSourceLogic[K, V, Msg]
 ) extends TimerGraphStageLogic(shape)
     with PromiseControl
     with MetricsControl
-    with MessageBuilder[K, V, Msg]
     with StageLogging {
   import SubSourceLogic._
 
@@ -59,7 +65,7 @@ private abstract class SubSourceLogic[K, V, Msg](
 
   /** We have created a source for these partitions, but it has not started up and is not in subSources yet. */
   var partitionsInStartup: immutable.Set[TopicPartition] = immutable.Set.empty
-  var subSources: Map[TopicPartition, Control] = immutable.Map.empty
+  var subSources: Map[TopicPartition, (Control, ActorRef)] = immutable.Map.empty
 
   /** Kafka has signalled these partitions are revoked, but some may be re-assigned just after revoking. */
   var partitionsToRevoke: Set[TopicPartition] = Set.empty
@@ -173,7 +179,7 @@ private abstract class SubSourceLogic[K, V, Msg](
       onRevoke(partitionsToRevoke)
       pendingPartitions --= partitionsToRevoke
       partitionsInStartup --= partitionsToRevoke
-      partitionsToRevoke.flatMap(subSources.get).foreach(_.shutdown())
+      partitionsToRevoke.flatMap(subSources.get).map(_._1).foreach(_.shutdown())
       subSources --= partitionsToRevoke
       partitionsToRevoke = Set.empty
   }
@@ -194,17 +200,18 @@ private abstract class SubSourceLogic[K, V, Msg](
         }
     }
 
-  val subsourceStartedCB: AsyncCallback[(TopicPartition, Control)] = getAsyncCallback[(TopicPartition, Control)] {
-    case (tp, control) =>
-      if (!partitionsInStartup.contains(tp)) {
-        // Partition was revoked while
-        // starting up.  Kill!
-        control.shutdown()
-      } else {
-        subSources += (tp -> control)
-        partitionsInStartup -= tp
-      }
-  }
+  val subsourceStartedCB: AsyncCallback[(TopicPartition, (Control, ActorRef))] =
+    getAsyncCallback[(TopicPartition, (Control, ActorRef))] {
+      case (tp, value @ (control, actorRef)) =>
+        if (!partitionsInStartup.contains(tp)) {
+          // Partition was revoked while
+          // starting up.  Kill!
+          control.shutdown()
+        } else {
+          subSources += (tp -> value)
+          partitionsInStartup -= tp
+        }
+    }
 
   setHandler(shape.out, new OutHandler {
     override def onPull(): Unit =
@@ -225,14 +232,14 @@ private abstract class SubSourceLogic[K, V, Msg](
 
       pendingPartitions = pendingPartitions.tail
       partitionsInStartup += tp
-      val subSource = Source.fromGraph(
-        new SubSourceStage(tp,
-                           consumerActor,
-                           subsourceStartedCB,
-                           subsourceCancelledCB,
-                           messageBuilder = this,
-                           actorNumber)
-      )
+      val graphStage = new GraphStage[SourceShape[Msg]] {
+        val out = Outlet[Msg]("out")
+        val shape = new SourceShape(out)
+
+        override def createLogic(inheritedAttributes: Attributes): GraphStageLogic =
+          msgSourceLogicFactory(shape, tp, consumerActor, subsourceStartedCB, subsourceCancelledCB, actorNumber)
+      }
+      val subSource = Source.fromGraph(graphStage)
       push(shape.out, (tp, subSource))
       emitSubSourcesForPendingPartitions()
     }
@@ -246,7 +253,7 @@ private abstract class SubSourceLogic[K, V, Msg](
   override def performStop(): Unit = {
     setKeepGoing(true)
     subSources.foreach {
-      case (_, control) => control.stop()
+      case (_, (control, _)) => control.stop()
     }
     complete(shape.out)
     onStop()
@@ -256,7 +263,7 @@ private abstract class SubSourceLogic[K, V, Msg](
     setKeepGoing(true)
     //todo we should wait for subsources to be shutdown and next shutdown main stage
     subSources.foreach {
-      case (_, control) => control.shutdown()
+      case (_, (control, _)) => control.shutdown()
     }
 
     if (!isClosed(shape.out)) {
@@ -273,6 +280,12 @@ private abstract class SubSourceLogic[K, V, Msg](
     })
   }
 
+  /**
+   * Opportunity for subclasses to add their logic to the partition assignment callbacks.
+   */
+  protected def addToPartitionAssignmentHandler(handler: PartitionAssignmentHandler): PartitionAssignmentHandler =
+    handler
+
 }
 
 /** Internal API */
@@ -281,90 +294,92 @@ private object SubSourceLogic {
 }
 
 /** Internal API */
-private final class SubSourceStage[K, V, Msg](
+@InternalApi
+private abstract class MessageSubSourceLogic[K, V, Msg](
+    val shape: SourceShape[Msg],
     tp: TopicPartition,
     consumerActor: ActorRef,
-    subSourceStartedCb: AsyncCallback[(TopicPartition, Control)],
+    subSourceStartedCb: AsyncCallback[(TopicPartition, (Control, ActorRef))],
     subSourceCancelledCb: AsyncCallback[(TopicPartition, Option[ConsumerRecord[K, V]])],
-    messageBuilder: MessageBuilder[K, V, Msg],
     actorNumber: Int
-) extends GraphStage[SourceShape[Msg]] { stage =>
-  val out = Outlet[Msg]("out")
-  val shape = new SourceShape(out)
+) extends GraphStageLogic(shape)
+    with MessageBuilder[K, V, Msg]
+    with PromiseControl
+    with MetricsControl
+    with StageLogging {
 
-  override def createLogic(inheritedAttributes: Attributes): GraphStageLogic =
-    new GraphStageLogic(shape) with PromiseControl with MetricsControl with StageLogging {
-      override def executionContext: ExecutionContext = materializer.executionContext
-      override def consumerFuture: Future[ActorRef] = Future.successful(consumerActor)
-      val shape = stage.shape
-      val requestMessages = KafkaConsumerActor.Internal.RequestMessages(0, Set(tp))
-      var requested = false
-      var subSourceActor: StageActor = _
-      var buffer: Iterator[ConsumerRecord[K, V]] = Iterator.empty
+  override def executionContext: ExecutionContext = materializer.executionContext
+  override def consumerFuture: Future[ActorRef] = Future.successful(consumerActor)
+  val requestMessages = KafkaConsumerActor.Internal.RequestMessages(0, Set(tp))
+  var requested = false
+  var subSourceActor: StageActor = _
+  var buffer: Iterator[ConsumerRecord[K, V]] = Iterator.empty
 
-      override def preStart(): Unit = {
-        log.debug("#{} Starting SubSource for partition {}", actorNumber, tp)
-        super.preStart()
-        subSourceStartedCb.invoke(tp -> this.asInstanceOf[Control])
-        subSourceActor = getStageActor {
-          case (_, msg: KafkaConsumerActor.Internal.Messages[K, V]) =>
-            requested = false
-            // do not use simple ++ because of https://issues.scala-lang.org/browse/SI-9766
-            if (buffer.hasNext) {
-              buffer = buffer ++ msg.messages
-            } else {
-              buffer = msg.messages
-            }
-            pump()
-          case (_, Status.Failure(e)) =>
-            failStage(e)
-          case (_, Terminated(ref)) if ref == consumerActor =>
-            failStage(new ConsumerFailed)
-        }
-        subSourceActor.watch(consumerActor)
-        consumerActor.tell(RegisterSubStage, subSourceActor.ref)
+  override def preStart(): Unit = {
+    log.debug("#{} Starting SubSource for partition {}", actorNumber, tp)
+    super.preStart()
+    subSourceActor = getStageActor(messageHandling)
+    subSourceActor.watch(consumerActor)
+    consumerActor.tell(RegisterSubStage, subSourceActor.ref)
+    val controlAndActor = (this.asInstanceOf[Control], subSourceActor.ref)
+    subSourceStartedCb.invoke(tp -> controlAndActor)
+  }
+
+  protected def messageHandling: PartialFunction[(ActorRef, Any), Unit] = {
+    case (_, msg: KafkaConsumerActor.Internal.Messages[K, V]) =>
+      requested = false
+      // do not use simple ++ because of https://issues.scala-lang.org/browse/SI-9766
+      if (buffer.hasNext) {
+        buffer = buffer ++ msg.messages
+      } else {
+        buffer = msg.messages
       }
+      pump()
+    case (_, Status.Failure(e)) =>
+      failStage(e)
+    case (_, Terminated(ref)) if ref == consumerActor =>
+      failStage(new ConsumerFailed)
+  }
 
-      override def postStop(): Unit = {
-        onShutdown()
-        super.postStop()
-      }
+  override def postStop(): Unit = {
+    onShutdown()
+    super.postStop()
+  }
 
-      setHandler(
-        out,
-        new OutHandler {
-          override def onPull(): Unit =
-            pump()
+  setHandler(
+    shape.out,
+    new OutHandler {
+      override def onPull(): Unit =
+        pump()
 
-          override def onDownstreamFinish(): Unit = {
-            val firstUnconsumed = if (buffer.hasNext) {
-              Some(buffer.next())
-            } else {
-              None
-            }
-
-            subSourceCancelledCb.invoke(tp -> firstUnconsumed)
-            super.onDownstreamFinish()
-          }
+      override def onDownstreamFinish(): Unit = {
+        val firstUnconsumed = if (buffer.hasNext) {
+          Some(buffer.next())
+        } else {
+          None
         }
-      )
 
-      def performShutdown() = {
-        log.debug("#{} Completing SubSource for partition {}", actorNumber, tp)
-        completeStage()
+        subSourceCancelledCb.invoke(tp -> firstUnconsumed)
+        super.onDownstreamFinish()
       }
+    }
+  )
 
-      @tailrec
-      private def pump(): Unit =
-        if (isAvailable(out)) {
-          if (buffer.hasNext) {
-            val msg = buffer.next()
-            push(out, messageBuilder.createMessage(msg))
-            pump()
-          } else if (!requested) {
-            requested = true
-            consumerActor.tell(requestMessages, subSourceActor.ref)
-          }
-        }
+  def performShutdown() = {
+    log.debug("#{} Completing SubSource for partition {}", actorNumber, tp)
+    completeStage()
+  }
+
+  @tailrec
+  private def pump(): Unit =
+    if (isAvailable(shape.out)) {
+      if (buffer.hasNext) {
+        val msg = buffer.next()
+        push(shape.out, createMessage(msg))
+        pump()
+      } else if (!requested) {
+        requested = true
+        consumerActor.tell(requestMessages, subSourceActor.ref)
+      }
     }
 }

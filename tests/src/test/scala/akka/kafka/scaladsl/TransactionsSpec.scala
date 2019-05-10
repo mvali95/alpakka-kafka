@@ -10,6 +10,7 @@ import java.util.concurrent.atomic.AtomicInteger
 import akka.Done
 import akka.kafka.ConsumerMessage.PartitionOffset
 import akka.kafka.{ProducerMessage, _}
+import akka.kafka.Subscriptions.TopicSubscription
 import akka.kafka.scaladsl.Consumer.Control
 import akka.kafka.testkit.scaladsl.{TestcontainersKafkaLike}
 import akka.stream.{Attributes, DelayOverflowStrategy, KillSwitches, UniqueKillSwitch}
@@ -53,6 +54,59 @@ class TransactionsSpec extends SpecBase with TestcontainersKafkaLike {
 
         probeConsumer.cancel()
         Await.result(control.shutdown(), remainingOrDefault)
+      }
+    }
+
+    "complete with partitioned source" in {
+      assertAllStagesStopped {
+        val maxPartitions = 2
+        val sourceTopic = createTopic(1, maxPartitions, 1)
+        val sinkTopic = createTopic(2)
+        val group = createGroupId(1)
+        val transactionalId = createTransactionalId()
+
+        Await.result(produce(sourceTopic, 1 to 100), remainingOrDefault)
+
+        val consumerSettings = consumerDefaults.withGroupId(group)
+
+        def runTransactional =
+          Transactional
+            .partitionedSource(consumerSettings, TopicSubscription(Set(sourceTopic), None))
+            .mapAsyncUnordered(maxPartitions) {
+              case (tp, source) =>
+                source
+                  .map { msg =>
+                    ProducerMessage.single(new ProducerRecord[String, String](sinkTopic, msg.record.value),
+                                           msg.partitionOffset)
+                  }
+                  .runWith(Transactional.sink(producerDefaults, transactionalId))
+            }
+            .toMat(Sink.ignore)(Keep.left)
+            .run()
+
+        val control = runTransactional
+
+        val control2 = runTransactional
+
+        Await.result(produce(sourceTopic, 101 to 200), remainingOrDefault)
+
+        val probeConsumerGroup = createGroupId(2)
+        val probeConsumerSettings = consumerDefaults
+          .withGroupId(probeConsumerGroup)
+          .withProperties(ConsumerConfig.ISOLATION_LEVEL_CONFIG -> "read_committed")
+
+        val probeConsumer = Consumer
+          .plainSource(probeConsumerSettings, TopicSubscription(Set(sinkTopic), None))
+          .map(_.value())
+          .runWith(TestSink.probe)
+
+        probeConsumer
+          .request(200)
+          .expectNextN((1 to 200).map(_.toString))
+
+        probeConsumer.cancel()
+        Await.result(control.shutdown(), remainingOrDefault)
+        Await.result(control2.shutdown(), remainingOrDefault)
       }
     }
 

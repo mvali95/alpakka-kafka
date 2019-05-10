@@ -8,7 +8,7 @@ package akka.kafka.internal
 import java.util.concurrent.{CompletableFuture, TimeUnit}
 
 import akka.actor.ActorSystem
-import akka.kafka.ConsumerMessage.{GroupTopicPartition, PartitionOffset}
+import akka.kafka.ConsumerMessage.{GroupTopicPartition, PartitionOffset, PartitionOffsetCommittedMarker}
 import akka.kafka.ProducerMessage._
 import akka.kafka.scaladsl.Producer
 import akka.kafka.{ConsumerMessage, ProducerMessage, ProducerSettings}
@@ -70,13 +70,20 @@ class ProducerSpec(_system: ActorSystem)
                        -1)
 
   def toMessage(tuple: (Record, RecordMetadata)) = Message(tuple._1, NotUsed)
-  private[kafka] def toTxMessage(tuple: (Record, RecordMetadata), committer: CommittedMarker) =
+  private[kafka] def toTxMessage(tuple: (Record, RecordMetadata), committer: CommittedMarker) = {
+    val consumerMessage = ConsumerMessage
+      .PartitionOffset(GroupTopicPartition(group, tuple._1.topic(), 1), tuple._2.offset())
+    val partitionOffsetCommittedMarker =
+      PartitionOffsetCommittedMarker(consumerMessage.key,
+                                     consumerMessage.offset,
+                                     committer,
+                                     fromPartitionedSource = false)
     ProducerMessage.Message(
       tuple._1,
-      ConsumerMessage
-        .PartitionOffset(GroupTopicPartition(group, tuple._1.topic(), 1), tuple._2.offset())
-        .withCommittedMarker(committer)
+      partitionOffsetCommittedMarker
     )
+  }
+
   def result(r: Record, m: RecordMetadata) = Result(m, ProducerMessage.Message(r, NotUsed))
   val toResult = (result _).tupled
 
@@ -97,7 +104,6 @@ class ProducerSpec(_system: ActorSystem)
         new DefaultProducerStage[K, V, P, Message[K, V, P], Result[K, V, P]](pSettings)
       )
       .mapAsync(1)(identity)
-  }
 
   def testTransactionProducerFlow[P](
       mock: ProducerMock[K, V],
@@ -109,7 +115,6 @@ class ProducerSpec(_system: ActorSystem)
         new TransactionalProducerStage[K, V, P](pSettings)
       )
       .mapAsync(1)(identity)
-  }
 
   "Producer" should "send one message and shutdown the producer gracefully" in {
     assertAllStagesStopped {
@@ -369,7 +374,7 @@ class ProducerSpec(_system: ActorSystem)
     }
   }
 
-  it should "initialize and begin a transaction when first run" in {
+  it should "not initialize a transaction when there are no messages" in {
     assertAllStagesStopped {
       val input = recordAndMetadata(1)
 
@@ -394,6 +399,25 @@ class ProducerSpec(_system: ActorSystem)
 
       source.sendComplete()
       sink.expectComplete()
+
+      client.verifyNoMoreInteractions()
+    }
+  }
+
+  it should "initialize and begin a transaction when first run" in {
+    assertAllStagesStopped {
+      val client = new ProducerMock[K, V](ProducerMock.handlers.fail)
+
+      val probe = Source
+        .single(toMessage(recordAndMetadata(1)))
+        .via(testTransactionProducerFlow(client))
+        .runWith(TestSink.probe)
+
+      probe
+        .request(1)
+        .expectError()
+
+      client.verifyTxInitialized()
     }
   }
 

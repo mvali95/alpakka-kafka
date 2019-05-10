@@ -30,10 +30,13 @@ import scala.util.{Failure, Success, Try}
 private[kafka] class DefaultProducerStage[K, V, P, IN <: Envelope[K, V, P], OUT <: Results[K, V, P]](
     val settings: ProducerSettings[K, V]
 ) extends GraphStage[FlowShape[IN, Future[OUT]]]
-    with ProducerStage[K, V, P, IN, OUT] {
+    with ProducerStage[K, V, P, IN, OUT, Unit] {
 
   override def createLogic(inheritedAttributes: Attributes): GraphStageLogic =
-    new DefaultProducerStageLogic(this, inheritedAttributes)
+    new DefaultProducerStageLogic(this, inheritedAttributes) {
+      // TODO: do we need to eagerly resolve a producer here?
+      //override protected var producer: Producer[K, V] = producerProvider(())
+    }
 }
 
 /**
@@ -41,8 +44,8 @@ private[kafka] class DefaultProducerStage[K, V, P, IN <: Envelope[K, V, P], OUT 
  *
  * Used by [[DefaultProducerStage]], extended by [[TransactionalProducerStageLogic]].
  */
-private class DefaultProducerStageLogic[K, V, P, IN <: Envelope[K, V, P], OUT <: Results[K, V, P]](
-    stage: ProducerStage[K, V, P, IN, OUT],
+private class DefaultProducerStageLogic[K, V, P, IN <: Envelope[K, V, P], OUT <: Results[K, V, P], S](
+    stage: ProducerStage[K, V, P, IN, OUT, S],
     inheritedAttributes: Attributes
 ) extends TimerGraphStageLogic(stage.shape)
     with StageLogging
@@ -113,6 +116,8 @@ private class DefaultProducerStageLogic[K, V, P, IN <: Envelope[K, V, P], OUT <:
     failStage(ex)
   }
 
+  def preSend(msg: Envelope[K, V, P]) = ()
+
   def postSend(msg: Envelope[K, V, P]) = ()
 
   protected def resumeDemand(tryToPull: Boolean = true): Unit = {
@@ -158,6 +163,7 @@ private class DefaultProducerStageLogic[K, V, P, IN <: Envelope[K, V, P], OUT <:
   def produce(in: Envelope[K, V, P]): Unit =
     in match {
       case msg: Message[K, V, P] =>
+        preSend(msg)
         val r = Promise[Result[K, V, P]]
         awaitingConfirmation.incrementAndGet()
         producer.send(msg.record, sendCallback(r, onSuccess = metadata => {
@@ -168,6 +174,7 @@ private class DefaultProducerStageLogic[K, V, P, IN <: Envelope[K, V, P], OUT <:
         push(stage.out, future)
 
       case multiMsg: MultiMessage[K, V, P] =>
+        preSend(multiMsg)
         val promises = for {
           msg <- multiMsg.records
         } yield {
@@ -185,6 +192,7 @@ private class DefaultProducerStageLogic[K, V, P, IN <: Envelope[K, V, P], OUT <:
         push(stage.out, future)
 
       case passthrough: PassThroughMessage[K, V, P] =>
+        preSend(passthrough)
         postSend(passthrough)
         val future = Future.successful(PassThroughResult[K, V, P](in.passThrough)).asInstanceOf[Future[OUT]]
         push(stage.out, future)
