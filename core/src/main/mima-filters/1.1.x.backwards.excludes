@@ -1,3 +1,4 @@
 # allow more parameters to private constructors
 ProblemFilters.exclude[DirectMissingMethodProblem]("akka.kafka.ProducerSettings.this")
 ProblemFilters.exclude[DirectMissingMethodProblem]("akka.kafka.ConsumerSettings.this")
+ProblemFilters.exclude[IncompatibleSignatureProblem]("akka.kafka.ConsumerMessage#PartitionOffsetCommittedMarker.unapply")

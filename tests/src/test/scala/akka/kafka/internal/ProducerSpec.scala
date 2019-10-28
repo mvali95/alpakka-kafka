@@ -104,6 +104,7 @@ class ProducerSpec(_system: ActorSystem)
         new DefaultProducerStage[K, V, P, Message[K, V, P], Result[K, V, P]](pSettings)
       )
       .mapAsync(1)(identity)
+  }
 
   def testTransactionProducerFlow[P](
       mock: ProducerMock[K, V],
@@ -112,9 +113,10 @@ class ProducerSpec(_system: ActorSystem)
     val pSettings = settings.withProducerFactory(_ => mock.mock).withCloseProducerOnStop(closeOnStop)
     Flow
       .fromGraph(
-        new TransactionalProducerStage[K, V, P](pSettings)
+        new TransactionalProducerStage[K, V, P](pSettings, "transactionalId")
       )
       .mapAsync(1)(identity)
+  }
 
   "Producer" should "send one message and shutdown the producer gracefully" in {
     assertAllStagesStopped {

@@ -292,6 +292,7 @@ class TransactionsSpec extends SpecBase with TestcontainersKafkaLike {
       Await.result(Future.sequence(futures), remainingOrDefault)
     }
 
+    // TODO: long running (~4 min). move to integration tests.
     "provide consistency when multiple transactional streams are being restarted" in assertAllStagesStopped {
       val sourcePartitions = 10
       val destinationPartitions = 4
@@ -409,6 +410,7 @@ class TransactionsSpec extends SpecBase with TestcontainersKafkaLike {
       controls.map(_.shutdown())
     }
 
+    // TODO: long running (~1 min). move to integration tests.
     "drain stream on partitions rebalancing" in assertAllStagesStopped {
       // Runs a copying transactional flows that delay writing to the output partition using a `delay` stage.
       // Creates more flows than ktps to trigger partition rebalancing.

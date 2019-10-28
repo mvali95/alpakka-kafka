@@ -20,7 +20,6 @@ import akka.stream.ActorAttributes
 import akka.stream.scaladsl.{Flow, FlowWithContext, Keep, Sink, Source, SourceWithContext}
 import akka.{Done, NotUsed}
 import org.apache.kafka.clients.consumer.ConsumerRecord
-import org.apache.kafka.clients.producer.ProducerConfig
 import org.apache.kafka.common.TopicPartition
 
 import scala.concurrent.Future
@@ -109,19 +108,9 @@ object Transactional {
     require(transactionalId != null && transactionalId.length > 0, "You must define a Transactional id.")
     require(settings.producerFactorySync.isEmpty, "You cannot use a shared or external producer factory.")
 
-    val txSettingsToProducer = (txid: String) => {
-      settings
-        .withProperties(
-          ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG -> true.toString,
-          ProducerConfig.TRANSACTIONAL_ID_CONFIG -> txid,
-          ProducerConfig.MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION -> 1.toString
-        )
-        .createKafkaProducer()
-    }
-
     val flow = Flow
       .fromGraph(
-        new TransactionalProducerStage[K, V, ConsumerMessage.PartitionOffset](txSettings)
+        new TransactionalProducerStage[K, V, ConsumerMessage.PartitionOffset](settings, transactionalId)
       )
       .mapAsync(settings.parallelism)(identity)
 

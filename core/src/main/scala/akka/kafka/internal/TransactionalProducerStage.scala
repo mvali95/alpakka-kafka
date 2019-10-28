@@ -9,12 +9,13 @@ import akka.Done
 import akka.annotation.InternalApi
 import akka.kafka.ConsumerMessage.{GroupTopicPartition, PartitionOffsetCommittedMarker}
 import akka.kafka.ProducerMessage.{Envelope, Results}
+import akka.kafka.internal.DefaultProducerStageLogic.{Assigned, AsyncCreateRequestSent, Unassigned}
 import akka.kafka.internal.ProducerStage.{MessageCallback, ProducerCompletionState}
 import akka.kafka.{ConsumerMessage, ProducerSettings}
 import akka.stream.stage._
 import akka.stream.{Attributes, FlowShape}
 import org.apache.kafka.clients.consumer.OffsetAndMetadata
-import org.apache.kafka.clients.producer.Producer
+import org.apache.kafka.clients.producer.{Producer, ProducerConfig}
 import org.apache.kafka.common.TopicPartition
 
 import scala.concurrent.Future
@@ -26,12 +27,13 @@ import scala.jdk.CollectionConverters._
  */
 @InternalApi
 private[kafka] final class TransactionalProducerStage[K, V, P](
-    val settings: ProducerSettings[K, V]
+    val settings: ProducerSettings[K, V],
+    transactionalId: String
 ) extends GraphStage[FlowShape[Envelope[K, V, P], Future[Results[K, V, P]]]]
     with ProducerStage[K, V, P, Envelope[K, V, P], Results[K, V, P], String] {
 
   override def createLogic(inheritedAttributes: Attributes): GraphStageLogic =
-    new TransactionalProducerStageLogic(this, inheritedAttributes)
+    new TransactionalProducerStageLogic(this, transactionalId, inheritedAttributes)
 }
 
 /** Internal API */
@@ -97,16 +99,14 @@ private object TransactionalProducerStage {
  */
 private final class TransactionalProducerStageLogic[K, V, P](
     stage: TransactionalProducerStage[K, V, P],
+    transactionalId: String,
     inheritedAttributes: Attributes
-) extends DefaultProducerStageLogic[K, V, P, Envelope[K, V, P], Results[K, V, P]](stage, inheritedAttributes)
+) extends DefaultProducerStageLogic[K, V, P, Envelope[K, V, P], Results[K, V, P], String](stage, inheritedAttributes)
     with StageLogging
     with MessageCallback[K, V, P]
     with ProducerCompletionState {
 
   import TransactionalProducerStage._
-
-  override protected var producer: Producer[K, V] = _
-  private var initiated: Boolean = _
 
   private val commitSchedulerKey = "commit"
   private val messageDrainInterval = 10.milliseconds
@@ -115,31 +115,37 @@ private final class TransactionalProducerStageLogic[K, V, P](
 
   private var demandSuspended = false
 
+  private var firstMessage: Option[Envelope[K, V, P]] = None
+
   override protected def logSource: Class[_] = classOf[TransactionalProducerStage[_, _, _]]
 
-  override def preStart(): Unit = {
-    initiated = false
-    resumeDemand(tryToPull = false)
-    scheduleOnce(commitSchedulerKey, commitInterval)
-  }
+  // we need to peek at the first message to generate the producer transactional id for partitioned sources
+  override def preStart(): Unit = resumeDemand()
 
   override protected def assignProducer(p: Producer[K, V]): Unit = {
     producer = p
+    changeProducerAssignmentLifecycle(Assigned)
     initTransactions()
     beginTransaction()
+    produceFirstMessage()
     resumeDemand()
+    scheduleOnce(commitSchedulerKey, stage.settings.eosCommitInterval)
   }
 
-  // suspend demand until a Producer has been created
-  suspendDemand()
+  private def produceFirstMessage(): Unit =
+    firstMessage = firstMessage.flatMap { msg =>
+      // produce first message before resuming demand
+      produce(msg)
+      None
+    }
 
   override protected def resumeDemand(tryToPull: Boolean = true): Unit = {
     super.resumeDemand(tryToPull)
     demandSuspended = false
   }
 
-  override protected def suspendDemand(): Unit = {
-    if (!demandSuspended) super.suspendDemand()
+  override protected def suspendDemand(fromStageLogicConstructor: Boolean = false): Unit = {
+    if (!demandSuspended) super.suspendDemand(fromStageLogicConstructor)
     demandSuspended = true
   }
 
@@ -161,19 +167,42 @@ private final class TransactionalProducerStageLogic[K, V, P](
     }
   }
 
-  override def preSend(msg: Envelope[K, V, P]): Unit =
-    if (!initiated) {
-      msg.passThrough match {
-        case committedMarker: PartitionOffsetCommittedMarker if committedMarker.fromPartitionedSource =>
-          val gtp = committedMarker.key
-          producer = producerProvider(s"$transactionalId-${gtp.groupId}-${gtp.topic}-${gtp.partition}")
-        case _ =>
-          producer = producerProvider(transactionalId)
-      }
-      initTransactions()
-      beginTransaction()
-      initiated = true
+  override def filterSend(msg: Envelope[K, V, P]): Boolean =
+    producerAssignmentLifecycle match {
+      case Assigned => true
+      case Unassigned =>
+        resolveProducer(generatedTransactionalConfig(msg))
+        if (firstMessage.nonEmpty) {
+          // this should never happen because demand should be suspended until the producer is assigned
+          throw new IllegalStateException("Cannot reapply first message")
+        }
+        // stash the first message so it can be sent after the producer is assigned
+        firstMessage = Some(msg)
+        // suspend demand after we receive the first message until the producer is assigned
+        suspendDemand()
+        false
+      case AsyncCreateRequestSent =>
+        throw new IllegalStateException(s"Should never receive new messages while in state '$AsyncCreateRequestSent'")
     }
+
+  private def generatedTransactionalConfig(msg: Envelope[K, V, P]): ProducerSettings[K, V] = {
+    val txId = msg.passThrough match {
+      case committedMarker: PartitionOffsetCommittedMarker if committedMarker.fromPartitionedSource =>
+        val gtp = committedMarker.key
+        s"$transactionalId-${gtp.groupId}-${gtp.topic}-${gtp.partition}"
+      case _ => transactionalId
+    }
+
+    stage.settings.withEnrichAsync { settings =>
+      Future.successful(
+        settings.withProperties(
+          ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG -> true.toString,
+          ProducerConfig.TRANSACTIONAL_ID_CONFIG -> txId,
+          ProducerConfig.MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION -> 1.toString
+        )
+      )
+    }
+  }
 
   override def postSend(msg: Envelope[K, V, P]): Unit = msg.passThrough match {
     case o: ConsumerMessage.PartitionOffsetCommittedMarker => batchOffsets = batchOffsets.updated(o)

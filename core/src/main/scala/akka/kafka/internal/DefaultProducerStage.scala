@@ -39,6 +39,13 @@ private[kafka] class DefaultProducerStage[K, V, P, IN <: Envelope[K, V, P], OUT 
     }
 }
 
+object DefaultProducerStageLogic {
+  sealed trait ProducerAssignmentLifecycle
+  case object Unassigned extends ProducerAssignmentLifecycle
+  case object AsyncCreateRequestSent extends ProducerAssignmentLifecycle
+  case object Assigned extends ProducerAssignmentLifecycle
+}
+
 /**
  * Internal API.
  *
@@ -52,10 +59,13 @@ private class DefaultProducerStageLogic[K, V, P, IN <: Envelope[K, V, P], OUT <:
     with MessageCallback[K, V, P]
     with ProducerCompletionState {
 
+  import DefaultProducerStageLogic._
+
   private lazy val decider: Decider =
     inheritedAttributes.get[SupervisionStrategy].map(_.decider).getOrElse(Supervision.stoppingDecider)
   protected val awaitingConfirmation = new AtomicInteger(0)
   protected var producer: Producer[K, V] = _
+  protected var producerAssignmentLifecycle: ProducerAssignmentLifecycle = Unassigned
   private var inIsClosed = false
   private var completionState: Option[Try[Done]] = None
 
@@ -63,16 +73,23 @@ private class DefaultProducerStageLogic[K, V, P, IN <: Envelope[K, V, P], OUT <:
 
   override def preStart(): Unit = {
     super.preStart()
-    resolveProducer()
+    resolveProducer(stage.settings)
+  }
+
+  protected def changeProducerAssignmentLifecycle(state: ProducerAssignmentLifecycle): Unit = {
+    val oldState = producerAssignmentLifecycle
+    producerAssignmentLifecycle = state
+    log.debug("Asynchronous producer assignment lifecycle changed '{} -> {}'", oldState, state)
   }
 
   protected def assignProducer(p: Producer[K, V]): Unit = {
     producer = p
+    changeProducerAssignmentLifecycle(Assigned)
     resumeDemand()
   }
 
-  private def resolveProducer(): Unit = {
-    val producerFuture = stage.settings.createKafkaProducerAsync()(materializer.executionContext)
+  protected def resolveProducer(settings: ProducerSettings[K, V]): Unit = {
+    val producerFuture = settings.createKafkaProducerAsync()(materializer.executionContext)
     producerFuture.value match {
       case Some(Success(p)) => assignProducer(p)
       case Some(Failure(e)) => failStage(e)
@@ -87,6 +104,7 @@ private class DefaultProducerStageLogic[K, V, P, IN <: Envelope[K, V, P], OUT <:
               e
             }
           )(ExecutionContexts.sameThreadExecutionContext)
+        changeProducerAssignmentLifecycle(AsyncCreateRequestSent)
     }
   }
 
@@ -116,11 +134,12 @@ private class DefaultProducerStageLogic[K, V, P, IN <: Envelope[K, V, P], OUT <:
     failStage(ex)
   }
 
-  def preSend(msg: Envelope[K, V, P]) = ()
+  def filterSend(msg: Envelope[K, V, P]): Boolean = true
 
-  def postSend(msg: Envelope[K, V, P]) = ()
+  def postSend(msg: Envelope[K, V, P]): Unit = ()
 
   protected def resumeDemand(tryToPull: Boolean = true): Unit = {
+    log.debug("Resume demand")
     setHandler(stage.out, new OutHandler {
       override def onPull(): Unit = tryPull(stage.in)
     })
@@ -130,21 +149,28 @@ private class DefaultProducerStageLogic[K, V, P, IN <: Envelope[K, V, P], OUT <:
     }
   }
 
-  protected def suspendDemand(): Unit =
+  protected def suspendDemand(fromStageLogicConstructor: Boolean = false): Unit = {
+    // not permitted to access stage logic members from constructor
+    if (!fromStageLogicConstructor) log.debug("Suspend demand")
     setHandler(
       stage.out,
       new OutHandler {
         override def onPull(): Unit = ()
       }
     )
+  }
 
   // suspend demand until a Producer has been created
-  suspendDemand()
+  suspendDemand(fromStageLogicConstructor = true)
 
   setHandler(
     stage.in,
     new InHandler {
-      override def onPush(): Unit = produce(grab(stage.in))
+      override def onPush(): Unit = {
+        val msg = grab(stage.in)
+        if (filterSend(msg))
+          produce(msg)
+      }
 
       override def onUpstreamFinish(): Unit = {
         inIsClosed = true
@@ -163,7 +189,6 @@ private class DefaultProducerStageLogic[K, V, P, IN <: Envelope[K, V, P], OUT <:
   def produce(in: Envelope[K, V, P]): Unit =
     in match {
       case msg: Message[K, V, P] =>
-        preSend(msg)
         val r = Promise[Result[K, V, P]]
         awaitingConfirmation.incrementAndGet()
         producer.send(msg.record, sendCallback(r, onSuccess = metadata => {
@@ -174,7 +199,6 @@ private class DefaultProducerStageLogic[K, V, P, IN <: Envelope[K, V, P], OUT <:
         push(stage.out, future)
 
       case multiMsg: MultiMessage[K, V, P] =>
-        preSend(multiMsg)
         val promises = for {
           msg <- multiMsg.records
         } yield {
@@ -192,7 +216,6 @@ private class DefaultProducerStageLogic[K, V, P, IN <: Envelope[K, V, P], OUT <:
         push(stage.out, future)
 
       case passthrough: PassThroughMessage[K, V, P] =>
-        preSend(passthrough)
         postSend(passthrough)
         val future = Future.successful(PassThroughResult[K, V, P](in.passThrough)).asInstanceOf[Future[OUT]]
         push(stage.out, future)
