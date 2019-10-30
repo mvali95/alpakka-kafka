@@ -65,6 +65,7 @@ object Transactional {
    * By generating the `transactionalId` from the [[TopicPartition]], multiple instances of your application can run
    * without having to manually assign partitions to each instance.
    */
+  @ApiMayChange
   def partitionedSource[K, V](
       consumerSettings: ConsumerSettings[K, V],
       subscription: AutoSubscription

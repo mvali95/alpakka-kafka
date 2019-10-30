@@ -1,4 +1,10 @@
 # allow more parameters to private constructors
 ProblemFilters.exclude[DirectMissingMethodProblem]("akka.kafka.ProducerSettings.this")
 ProblemFilters.exclude[DirectMissingMethodProblem]("akka.kafka.ConsumerSettings.this")
+# PR #930 Transactional.partitionedSource
+# https://github.com/akka/alpakka-kafka/pull/930
+ProblemFilters.exclude[MissingTypesProblem]("akka.kafka.ConsumerMessage$PartitionOffsetCommittedMarker$")
+ProblemFilters.exclude[DirectMissingMethodProblem]("akka.kafka.ConsumerMessage#PartitionOffsetCommittedMarker.apply")
+ProblemFilters.exclude[DirectMissingMethodProblem]("akka.kafka.ConsumerMessage#PartitionOffsetCommittedMarker.this")
+ProblemFilters.exclude[DirectMissingMethodProblem]("akka.kafka.ConsumerMessage#PartitionOffset.withCommittedMarker")
 ProblemFilters.exclude[IncompatibleSignatureProblem]("akka.kafka.ConsumerMessage#PartitionOffsetCommittedMarker.unapply")

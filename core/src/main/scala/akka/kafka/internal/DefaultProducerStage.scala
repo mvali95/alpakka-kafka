@@ -30,16 +30,13 @@ import scala.util.{Failure, Success, Try}
 private[kafka] class DefaultProducerStage[K, V, P, IN <: Envelope[K, V, P], OUT <: Results[K, V, P]](
     val settings: ProducerSettings[K, V]
 ) extends GraphStage[FlowShape[IN, Future[OUT]]]
-    with ProducerStage[K, V, P, IN, OUT, Unit] {
+    with ProducerStage[K, V, P, IN, OUT] {
 
   override def createLogic(inheritedAttributes: Attributes): GraphStageLogic =
-    new DefaultProducerStageLogic(this, inheritedAttributes) {
-      // TODO: do we need to eagerly resolve a producer here?
-      //override protected var producer: Producer[K, V] = producerProvider(())
-    }
+    new DefaultProducerStageLogic(this, inheritedAttributes)
 }
 
-object DefaultProducerStageLogic {
+private[kafka] object DefaultProducerStageLogic {
   sealed trait ProducerAssignmentLifecycle
   case object Unassigned extends ProducerAssignmentLifecycle
   case object AsyncCreateRequestSent extends ProducerAssignmentLifecycle
@@ -51,8 +48,8 @@ object DefaultProducerStageLogic {
  *
  * Used by [[DefaultProducerStage]], extended by [[TransactionalProducerStageLogic]].
  */
-private class DefaultProducerStageLogic[K, V, P, IN <: Envelope[K, V, P], OUT <: Results[K, V, P], S](
-    stage: ProducerStage[K, V, P, IN, OUT, S],
+private class DefaultProducerStageLogic[K, V, P, IN <: Envelope[K, V, P], OUT <: Results[K, V, P]](
+    stage: ProducerStage[K, V, P, IN, OUT],
     inheritedAttributes: Attributes
 ) extends TimerGraphStageLogic(stage.shape)
     with StageLogging

@@ -46,7 +46,7 @@ private[kafka] trait TransactionalMessageBuilderBase[K, V, Msg] extends MessageB
 
   def onMessage(consumerMessage: ConsumerRecord[K, V]): Unit
 
-  val fromPartitionedSource: Boolean
+  def fromPartitionedSource: Boolean
 }
 
 /** Internal API */
@@ -55,13 +55,16 @@ private[kafka] trait TransactionalMessageBuilder[K, V]
     extends TransactionalMessageBuilderBase[K, V, TransactionalMessage[K, V]] {
   override def createMessage(rec: ConsumerRecord[K, V]): TransactionalMessage[K, V] = {
     onMessage(rec)
-    val groupTopicPartition = GroupTopicPartition(
-      groupId = groupId,
-      topic = rec.topic,
-      partition = rec.partition
+    val offset = PartitionOffsetCommittedMarker(
+      GroupTopicPartition(
+        groupId = groupId,
+        topic = rec.topic,
+        partition = rec.partition
+      ),
+      offset = rec.offset,
+      committedMarker,
+      fromPartitionedSource
     )
-    val offset =
-      PartitionOffsetCommittedMarker(groupTopicPartition, offset = rec.offset, committedMarker, fromPartitionedSource)
     ConsumerMessage.TransactionalMessage(rec, offset)
   }
 }
@@ -72,13 +75,16 @@ private[kafka] trait TransactionalOffsetContextBuilder[K, V]
     extends TransactionalMessageBuilderBase[K, V, (ConsumerRecord[K, V], PartitionOffset)] {
   override def createMessage(rec: ConsumerRecord[K, V]): (ConsumerRecord[K, V], PartitionOffset) = {
     onMessage(rec)
-    val groupTopicPartition = GroupTopicPartition(
-      groupId = groupId,
-      topic = rec.topic,
-      partition = rec.partition
+    val offset = PartitionOffsetCommittedMarker(
+      GroupTopicPartition(
+        groupId = groupId,
+        topic = rec.topic,
+        partition = rec.partition
+      ),
+      offset = rec.offset,
+      committedMarker,
+      fromPartitionedSource
     )
-    val offset =
-      PartitionOffsetCommittedMarker(groupTopicPartition, offset = rec.offset, committedMarker, fromPartitionedSource)
     (rec, offset)
   }
 }

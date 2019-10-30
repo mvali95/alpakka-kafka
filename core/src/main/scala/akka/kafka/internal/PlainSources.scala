@@ -57,7 +57,7 @@ private[kafka] final class PlainSubSource[K, V](
           shape: SourceShape[ConsumerRecord[K, V]],
           tp: TopicPartition,
           consumerActor: ActorRef,
-          subSourceStartedCb: AsyncCallback[(TopicPartition, (Control, ActorRef))],
+          subSourceStartedCb: AsyncCallback[(TopicPartition, ControlAndStageActor)],
           subSourceCancelledCb: AsyncCallback[(TopicPartition, Option[ConsumerRecord[K, V]])],
           actorNumber: Int
       ): SubSourceStageLogic[K, V, ConsumerRecord[K, V]] =

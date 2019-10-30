@@ -30,7 +30,7 @@ private[kafka] final class TransactionalProducerStage[K, V, P](
     val settings: ProducerSettings[K, V],
     transactionalId: String
 ) extends GraphStage[FlowShape[Envelope[K, V, P], Future[Results[K, V, P]]]]
-    with ProducerStage[K, V, P, Envelope[K, V, P], Results[K, V, P], String] {
+    with ProducerStage[K, V, P, Envelope[K, V, P], Results[K, V, P]] {
 
   override def createLogic(inheritedAttributes: Attributes): GraphStageLogic =
     new TransactionalProducerStageLogic(this, transactionalId, inheritedAttributes)
@@ -101,7 +101,7 @@ private final class TransactionalProducerStageLogic[K, V, P](
     stage: TransactionalProducerStage[K, V, P],
     transactionalId: String,
     inheritedAttributes: Attributes
-) extends DefaultProducerStageLogic[K, V, P, Envelope[K, V, P], Results[K, V, P], String](stage, inheritedAttributes)
+) extends DefaultProducerStageLogic[K, V, P, Envelope[K, V, P], Results[K, V, P]](stage, inheritedAttributes)
     with StageLogging
     with MessageCallback[K, V, P]
     with ProducerCompletionState {
@@ -265,6 +265,6 @@ private final class TransactionalProducerStageLogic[K, V, P](
 
   private def abortTransaction(): Unit = {
     log.debug("Aborting transaction")
-    Option(producer).foreach(_.abortTransaction())
+    if (producer != null) producer.abortTransaction()
   }
 }

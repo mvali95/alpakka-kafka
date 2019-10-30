@@ -68,7 +68,7 @@ private class SubSourceLogic[K, V, Msg](
 
   /** We have created a source for these partitions, but it has not started up and is not in subSources yet. */
   var partitionsInStartup: immutable.Set[TopicPartition] = immutable.Set.empty
-  var subSources: Map[TopicPartition, (Control, ActorRef)] = immutable.Map.empty
+  var subSources: Map[TopicPartition, ControlAndStageActor] = immutable.Map.empty
 
   /** Kafka has signalled these partitions are revoked, but some may be re-assigned just after revoking. */
   var partitionsToRevoke: Set[TopicPartition] = Set.empty
@@ -182,7 +182,7 @@ private class SubSourceLogic[K, V, Msg](
       onRevoke(partitionsToRevoke)
       pendingPartitions --= partitionsToRevoke
       partitionsInStartup --= partitionsToRevoke
-      partitionsToRevoke.flatMap(subSources.get).map(_._1).foreach(_.shutdown())
+      partitionsToRevoke.flatMap(subSources.get).map(_.control).foreach(_.shutdown())
       subSources --= partitionsToRevoke
       partitionsToRevoke = Set.empty
   }
@@ -203,9 +203,9 @@ private class SubSourceLogic[K, V, Msg](
         }
     }
 
-  val subsourceStartedCB: AsyncCallback[(TopicPartition, (Control, ActorRef))] =
-    getAsyncCallback[(TopicPartition, (Control, ActorRef))] {
-      case (tp, value @ (control, actorRef)) =>
+  val subsourceStartedCB: AsyncCallback[(TopicPartition, ControlAndStageActor)] =
+    getAsyncCallback[(TopicPartition, ControlAndStageActor)] {
+      case (tp, value @ ControlAndStageActor(control, actorRef)) =>
         if (!partitionsInStartup.contains(tp)) {
           // Partition was revoked while
           // starting up.  Kill!
@@ -256,7 +256,7 @@ private class SubSourceLogic[K, V, Msg](
   override def performStop(): Unit = {
     setKeepGoing(true)
     subSources.foreach {
-      case (_, (control, _)) => control.stop()
+      case (_, ControlAndStageActor(control, _)) => control.stop()
     }
     complete(shape.out)
     onStop()
@@ -266,7 +266,7 @@ private class SubSourceLogic[K, V, Msg](
     setKeepGoing(true)
     //todo we should wait for subsources to be shutdown and next shutdown main stage
     subSources.foreach {
-      case (_, (control, _)) => control.shutdown()
+      case (_, ControlAndStageActor(control, _)) => control.shutdown()
     }
 
     if (!isClosed(shape.out)) {
@@ -304,7 +304,7 @@ private object SubSourceLogic {
 private final class SubSourceStage[K, V, Msg](
     tp: TopicPartition,
     consumerActor: ActorRef,
-    subSourceStartedCb: AsyncCallback[(TopicPartition, (Control, ActorRef))],
+    subSourceStartedCb: AsyncCallback[(TopicPartition, ControlAndStageActor)],
     subSourceCancelledCb: AsyncCallback[(TopicPartition, Option[ConsumerRecord[K, V]])],
     actorNumber: Int,
     subSourceStageLogicFactory: SubSourceStageLogicFactory[K, V, Msg]
@@ -319,6 +319,13 @@ private final class SubSourceStage[K, V, Msg](
 
 /** Internal API
  *
+ * SubSourceStageLogic [[akka.kafka.scaladsl.Consumer.Control]] and the stage actor [[ActorRef]]
+ */
+@InternalApi
+private final case class ControlAndStageActor(control: Control, stageActor: ActorRef)
+
+/** Internal API
+ *
  * Encapsulates a factory method to create a `SubSourceStageLogic` within `SubSourceLogic` where the context
  * parameters exist.
  */
@@ -328,7 +335,7 @@ private trait SubSourceStageLogicFactory[K, V, Msg] {
       shape: SourceShape[Msg],
       tp: TopicPartition,
       consumerActor: ActorRef,
-      subSourceStartedCb: AsyncCallback[(TopicPartition, (Control, ActorRef))],
+      subSourceStartedCb: AsyncCallback[(TopicPartition, ControlAndStageActor)],
       subSourceCancelledCb: AsyncCallback[(TopicPartition, Option[ConsumerRecord[K, V]])],
       actorNumber: Int
   ): SubSourceStageLogic[K, V, Msg]
@@ -344,7 +351,7 @@ private abstract class SubSourceStageLogic[K, V, Msg](
     val shape: SourceShape[Msg],
     tp: TopicPartition,
     consumerActor: ActorRef,
-    subSourceStartedCb: AsyncCallback[(TopicPartition, (Control, ActorRef))],
+    subSourceStartedCb: AsyncCallback[(TopicPartition, ControlAndStageActor)],
     subSourceCancelledCb: AsyncCallback[(TopicPartition, Option[ConsumerRecord[K, V]])],
     actorNumber: Int
 ) extends GraphStageLogic(shape)
@@ -354,7 +361,7 @@ private abstract class SubSourceStageLogic[K, V, Msg](
     with StageLogging {
   override def executionContext: ExecutionContext = materializer.executionContext
   override def consumerFuture: Future[ActorRef] = Future.successful(consumerActor)
-  val requestMessages = KafkaConsumerActor.Internal.RequestMessages(0, Set(tp))
+  private val requestMessages = KafkaConsumerActor.Internal.RequestMessages(0, Set(tp))
   var requested = false
   var subSourceActor: StageActor = _
   var buffer: Iterator[ConsumerRecord[K, V]] = Iterator.empty
@@ -365,7 +372,7 @@ private abstract class SubSourceStageLogic[K, V, Msg](
     subSourceActor = getStageActor(messageHandling)
     subSourceActor.watch(consumerActor)
     consumerActor.tell(RegisterSubStage, subSourceActor.ref)
-    val controlAndActor = (this.asInstanceOf[Control], subSourceActor.ref)
+    val controlAndActor = ControlAndStageActor(this.asInstanceOf[Control], subSourceActor.ref)
     subSourceStartedCb.invoke(tp -> controlAndActor)
   }
 

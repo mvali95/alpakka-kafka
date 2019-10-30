@@ -10,7 +10,6 @@ import java.util.concurrent.atomic.AtomicInteger
 import akka.Done
 import akka.kafka.ConsumerMessage.PartitionOffset
 import akka.kafka.{ProducerMessage, _}
-import akka.kafka.Subscriptions.TopicSubscription
 import akka.kafka.scaladsl.Consumer.Control
 import akka.kafka.testkit.scaladsl.{TestcontainersKafkaLike}
 import akka.stream.{Attributes, DelayOverflowStrategy, KillSwitches, UniqueKillSwitch}
@@ -71,7 +70,7 @@ class TransactionsSpec extends SpecBase with TestcontainersKafkaLike {
 
         def runTransactional =
           Transactional
-            .partitionedSource(consumerSettings, TopicSubscription(Set(sourceTopic), None))
+            .partitionedSource(consumerSettings, Subscriptions.topics(sourceTopic))
             .mapAsyncUnordered(maxPartitions) {
               case (tp, source) =>
                 source
@@ -96,7 +95,7 @@ class TransactionsSpec extends SpecBase with TestcontainersKafkaLike {
           .withProperties(ConsumerConfig.ISOLATION_LEVEL_CONFIG -> "read_committed")
 
         val probeConsumer = Consumer
-          .plainSource(probeConsumerSettings, TopicSubscription(Set(sinkTopic), None))
+          .plainSource(probeConsumerSettings, Subscriptions.topics(sourceTopic))
           .map(_.value())
           .runWith(TestSink.probe)
 
