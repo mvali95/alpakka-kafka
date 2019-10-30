@@ -32,7 +32,15 @@ import scala.util.{Failure, Success}
 /**
  * Internal API.
  *
- * Anonymous sub-class instance is created in [[CommittableSubSource]], [[PlainSubSource]] and [[TransactionalSubSource]].
+ * A `SubSourceLogic` is used to create partitioned sources from the various types of sub sources available:
+ * [[CommittableSubSource]], [[PlainSubSource]] and [[TransactionalSubSource]].
+ *
+ * A `SubSourceLogic` emits a source of `SubSourceStage` per subscribed Kafka partition.
+ *
+ * The `SubSourceLogic.subSourceStageLogicFactory` parameter is passed to each `SubSourceStage` so that a new
+ * `SubSourceStageLogic` can be created for each stage. Context parameters from the `SubSourceLogic` are passed down to
+ * `SubSourceStage` and on to the `SubSourceStageLogicFactory` when the stage creates a `GraphStageLogic`.
+ *
  */
 @InternalApi
 private class SubSourceLogic[K, V, Msg](
@@ -41,12 +49,7 @@ private class SubSourceLogic[K, V, Msg](
     subscription: AutoSubscription,
     getOffsetsOnAssign: Option[Set[TopicPartition] => Future[Map[TopicPartition, Long]]] = None,
     onRevoke: Set[TopicPartition] => Unit = _ => (),
-    msgSourceLogicFactory: (SourceShape[Msg],
-                            TopicPartition,
-                            ActorRef,
-                            AsyncCallback[(TopicPartition, (Control, ActorRef))],
-                            AsyncCallback[(TopicPartition, Option[ConsumerRecord[K, V]])],
-                            Int) => MessageSubSourceLogic[K, V, Msg]
+    subSourceStageLogicFactory: SubSourceStageLogicFactory[K, V, Msg]
 ) extends TimerGraphStageLogic(shape)
     with PromiseControl
     with MetricsControl
@@ -232,14 +235,14 @@ private class SubSourceLogic[K, V, Msg](
 
       pendingPartitions = pendingPartitions.tail
       partitionsInStartup += tp
-      val graphStage = new GraphStage[SourceShape[Msg]] {
-        val out = Outlet[Msg]("out")
-        val shape = new SourceShape(out)
-
-        override def createLogic(inheritedAttributes: Attributes): GraphStageLogic =
-          msgSourceLogicFactory(shape, tp, consumerActor, subsourceStartedCB, subsourceCancelledCB, actorNumber)
-      }
-      val subSource = Source.fromGraph(graphStage)
+      val subSource = Source.fromGraph(
+        new SubSourceStage(tp,
+                           consumerActor,
+                           subsourceStartedCB,
+                           subsourceCancelledCB,
+                           actorNumber,
+                           subSourceStageLogicFactory)
+      )
       push(shape.out, (tp, subSource))
       emitSubSourcesForPendingPartitions()
     }
@@ -293,9 +296,51 @@ private object SubSourceLogic {
   case object CloseRevokedPartitions
 }
 
-/** Internal API */
+/** Internal API
+ *
+ * A `SubSourceStage` is created per partition in `SubSourceLogic`.
+ */
 @InternalApi
-private abstract class MessageSubSourceLogic[K, V, Msg](
+private final class SubSourceStage[K, V, Msg](
+    tp: TopicPartition,
+    consumerActor: ActorRef,
+    subSourceStartedCb: AsyncCallback[(TopicPartition, (Control, ActorRef))],
+    subSourceCancelledCb: AsyncCallback[(TopicPartition, Option[ConsumerRecord[K, V]])],
+    actorNumber: Int,
+    subSourceStageLogicFactory: SubSourceStageLogicFactory[K, V, Msg]
+) extends GraphStage[SourceShape[Msg]] { stage =>
+
+  val out = Outlet[Msg]("out")
+  val shape: SourceShape[Msg] = new SourceShape(out)
+
+  override def createLogic(inheritedAttributes: Attributes): GraphStageLogic =
+    subSourceStageLogicFactory.create(shape, tp, consumerActor, subSourceStartedCb, subSourceCancelledCb, actorNumber)
+}
+
+/** Internal API
+ *
+ * Encapsulates a factory method to create a `SubSourceStageLogic` within `SubSourceLogic` where the context
+ * parameters exist.
+ */
+@InternalApi
+private trait SubSourceStageLogicFactory[K, V, Msg] {
+  def create(
+      shape: SourceShape[Msg],
+      tp: TopicPartition,
+      consumerActor: ActorRef,
+      subSourceStartedCb: AsyncCallback[(TopicPartition, (Control, ActorRef))],
+      subSourceCancelledCb: AsyncCallback[(TopicPartition, Option[ConsumerRecord[K, V]])],
+      actorNumber: Int
+  ): SubSourceStageLogic[K, V, Msg]
+}
+
+/** Internal API
+ *
+ * A `SubSourceStageLogic` is the `GraphStageLogic` of a SubSourceStage.
+ * This emits Kafka messages downstream (not sources).
+ */
+@InternalApi
+private abstract class SubSourceStageLogic[K, V, Msg](
     val shape: SourceShape[Msg],
     tp: TopicPartition,
     consumerActor: ActorRef,
@@ -303,11 +348,10 @@ private abstract class MessageSubSourceLogic[K, V, Msg](
     subSourceCancelledCb: AsyncCallback[(TopicPartition, Option[ConsumerRecord[K, V]])],
     actorNumber: Int
 ) extends GraphStageLogic(shape)
-    with MessageBuilder[K, V, Msg]
     with PromiseControl
     with MetricsControl
+    with MessageBuilder[K, V, Msg]
     with StageLogging {
-
   override def executionContext: ExecutionContext = materializer.executionContext
   override def consumerFuture: Future[ActorRef] = Future.successful(consumerActor)
   val requestMessages = KafkaConsumerActor.Internal.RequestMessages(0, Set(tp))

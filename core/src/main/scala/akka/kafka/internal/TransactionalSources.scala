@@ -211,87 +211,26 @@ private[kafka] final class TransactionalSubSource[K, V](
   override protected def logic(
       shape: SourceShape[(TopicPartition, Source[TransactionalMessage[K, V], NotUsed])]
   ): GraphStageLogic with Control = {
-    def factory(shape: SourceShape[TransactionalMessage[K, V]],
-                tp: TopicPartition,
-                consumerActor: ActorRef,
-                subSourceStartedCb: AsyncCallback[(TopicPartition, (Control, ActorRef))],
-                subSourceCancelledCb: AsyncCallback[(TopicPartition, Option[ConsumerRecord[K, V]])],
-                actorNumber: Int): MessageSubSourceLogic[K, V, TransactionalMessage[K, V]] =
-      new MessageSubSourceLogic[K, V, TransactionalMessage[K, V]](shape,
-                                                                  tp,
-                                                                  consumerActor,
-                                                                  subSourceStartedCb,
-                                                                  subSourceCancelledCb,
-                                                                  actorNumber) with TransactionalMessageBuilder[K, V] {
+    val factory = new SubSourceStageLogicFactory[K, V, TransactionalMessage[K, V]] {
+      def create(
+          shape: SourceShape[TransactionalMessage[K, V]],
+          tp: TopicPartition,
+          consumerActor: ActorRef,
+          subSourceStartedCb: AsyncCallback[(TopicPartition, (Control, ActorRef))],
+          subSourceCancelledCb: AsyncCallback[(TopicPartition, Option[ConsumerRecord[K, V]])],
+          actorNumber: Int
+      ): SubSourceStageLogic[K, V, TransactionalMessage[K, V]] =
+        new TransactionalSubSourceStageLogic(shape,
+                                             tp,
+                                             consumerActor,
+                                             subSourceStartedCb,
+                                             subSourceCancelledCb,
+                                             actorNumber,
+                                             txConsumerSettings)
+    }
 
-        override val fromPartitionedSource: Boolean = true
-        val inFlightRecords = InFlightRecords.empty
+    new SubSourceLogic(shape, txConsumerSettings, subscription, subSourceStageLogicFactory = factory) {
 
-        override protected def messageHandling: PartialFunction[(ActorRef, Any), Unit] =
-          super.messageHandling.orElse(drainHandling).orElse {
-            case (_, Revoked(tps)) =>
-              inFlightRecords.revoke(tps.toSet)
-          }
-
-        def shuttingDownReceive: PartialFunction[(ActorRef, Any), Unit] =
-          drainHandling
-            .orElse {
-              case (_, Status.Failure(e)) =>
-                failStage(e)
-              case (_, Terminated(ref)) if ref == consumerActor =>
-                failStage(new ConsumerFailed())
-            }
-
-        override def performShutdown(): Unit = {
-          setKeepGoing(true)
-          if (!isClosed(shape.out)) {
-            complete(shape.out)
-          }
-          subSourceActor.become(shuttingDownReceive)
-          drainAndComplete()
-        }
-
-        def drainAndComplete(): Unit =
-          subSourceActor.ref.tell(Drain(inFlightRecords.assigned(), None, "complete"), subSourceActor.ref)
-
-        def drainHandling: PartialFunction[(ActorRef, Any), Unit] = {
-          case (sender, Committed(offsets)) =>
-            inFlightRecords.committed(offsets.view.mapValues(_.offset() - 1).toMap)
-            sender ! Done
-          case (sender, CommittingFailure) => {
-            log.info("Committing failed, resetting in flight offsets")
-            inFlightRecords.reset()
-          }
-          case (sender, Drain(partitions, ack, msg)) =>
-            if (inFlightRecords.empty(partitions)) {
-              log.debug(s"Partitions drained ${partitions.mkString(",")}")
-              ack.getOrElse(sender) ! msg
-            } else {
-              log.debug(s"Draining partitions {}", partitions)
-              materializer.scheduleOnce(consumerSettings.drainingCheckInterval, new Runnable {
-                override def run(): Unit =
-                  subSourceActor.ref ! Drain(partitions, ack.orElse(Some(sender)), msg)
-              })
-            }
-          case (sender, "complete") =>
-            completeStage()
-        }
-
-        override def groupId: String = txConsumerSettings.properties(ConsumerConfig.GROUP_ID_CONFIG)
-
-        lazy val committedMarker: CommittedMarker = {
-          val ec = materializer.executionContext
-          CommittedMarkerRef(subSourceActor.ref, consumerSettings.commitTimeout)(ec)
-        }
-
-        override def onMessage(rec: ConsumerRecord[K, V]): Unit =
-          inFlightRecords.add(Map(new TopicPartition(rec.topic(), rec.partition()) -> rec.offset()))
-      }
-
-    new SubSourceLogic[K, V, TransactionalMessage[K, V]](shape,
-                                                         txConsumerSettings,
-                                                         subscription,
-                                                         msgSourceLogicFactory = factory) {
       override protected def addToPartitionAssignmentHandler(
           handler: PartitionAssignmentHandler
       ): PartitionAssignmentHandler = {
@@ -327,7 +266,6 @@ private[kafka] final class TransactionalSubSource[K, V](
         }
       }
     }
-
   }
 }
 
@@ -396,5 +334,83 @@ private object TransactionalSourceLogic {
 
       override def assigned(): Set[TopicPartition] = inFlightRecords.keySet
     }
+  }
+}
+
+@InternalApi
+private class TransactionalSubSourceStageLogic[K, V](
+    shape: SourceShape[TransactionalMessage[K, V]],
+    tp: TopicPartition,
+    consumerActor: ActorRef,
+    subSourceStartedCb: AsyncCallback[(TopicPartition, (Control, ActorRef))],
+    subSourceCancelledCb: AsyncCallback[(TopicPartition, Option[ConsumerRecord[K, V]])],
+    actorNumber: Int,
+    consumerSettings: ConsumerSettings[K, V]
+) extends SubSourceStageLogic(shape, tp, consumerActor, subSourceStartedCb, subSourceCancelledCb, actorNumber)
+    with TransactionalMessageBuilder[K, V] {
+  import TransactionalSourceLogic._
+
+  val inFlightRecords = InFlightRecords.empty
+
+  override def groupId: String = consumerSettings.properties(ConsumerConfig.GROUP_ID_CONFIG)
+
+  override def onMessage(rec: ConsumerRecord[K, V]): Unit =
+    inFlightRecords.add(Map(new TopicPartition(rec.topic(), rec.partition()) -> rec.offset()))
+
+  override val fromPartitionedSource: Boolean = true
+
+  override protected def messageHandling: PartialFunction[(ActorRef, Any), Unit] =
+    super.messageHandling.orElse(drainHandling).orElse {
+      case (_, Revoked(tps)) =>
+        inFlightRecords.revoke(tps.toSet)
+    }
+
+  def shuttingDownReceive: PartialFunction[(ActorRef, Any), Unit] =
+    drainHandling
+      .orElse {
+        case (_, Status.Failure(e)) =>
+          failStage(e)
+        case (_, Terminated(ref)) if ref == consumerActor =>
+          failStage(new ConsumerFailed())
+      }
+
+  override def performShutdown(): Unit = {
+    setKeepGoing(true)
+    if (!isClosed(shape.out)) {
+      complete(shape.out)
+    }
+    subSourceActor.become(shuttingDownReceive)
+    drainAndComplete()
+  }
+
+  def drainAndComplete(): Unit =
+    subSourceActor.ref.tell(Drain(inFlightRecords.assigned(), None, "complete"), subSourceActor.ref)
+
+  def drainHandling: PartialFunction[(ActorRef, Any), Unit] = {
+    case (sender, Committed(offsets)) =>
+      inFlightRecords.committed(offsets.view.mapValues(_.offset() - 1).toMap)
+      sender ! Done
+    case (sender, CommittingFailure) => {
+      log.info("Committing failed, resetting in flight offsets")
+      inFlightRecords.reset()
+    }
+    case (sender, Drain(partitions, ack, msg)) =>
+      if (inFlightRecords.empty(partitions)) {
+        log.debug(s"Partitions drained ${partitions.mkString(",")}")
+        ack.getOrElse(sender) ! msg
+      } else {
+        log.debug(s"Draining partitions {}", partitions)
+        materializer.scheduleOnce(consumerSettings.drainingCheckInterval, new Runnable {
+          override def run(): Unit =
+            subSourceActor.ref ! Drain(partitions, ack.orElse(Some(sender)), msg)
+        })
+      }
+    case (sender, "complete") =>
+      completeStage()
+  }
+
+  lazy val committedMarker: CommittedMarker = {
+    val ec = materializer.executionContext
+    CommittedMarkerRef(subSourceActor.ref, consumerSettings.commitTimeout)(ec)
   }
 }

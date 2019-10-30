@@ -51,18 +51,25 @@ private[kafka] final class PlainSubSource[K, V](
   override protected def logic(
       shape: SourceShape[(TopicPartition, Source[ConsumerRecord[K, V], NotUsed])]
   ): GraphStageLogic with Control = {
-    def factory(shape: SourceShape[ConsumerRecord[K, V]],
-                tp: TopicPartition,
-                consumerActor: ActorRef,
-                subSourceStartedCb: AsyncCallback[(TopicPartition, (Control, ActorRef))],
-                subSourceCancelledCb: AsyncCallback[(TopicPartition, Option[ConsumerRecord[K, V]])],
-                actorNumber: Int): MessageSubSourceLogic[K, V, ConsumerRecord[K, V]] =
-      new MessageSubSourceLogic[K, V, ConsumerRecord[K, V]](shape,
-                                                            tp,
-                                                            consumerActor,
-                                                            subSourceStartedCb,
-                                                            subSourceCancelledCb,
-                                                            actorNumber) with PlainMessageBuilder[K, V]
-    new SubSourceLogic[K, V, ConsumerRecord[K, V]](shape, settings, subscription, getOffsetsOnAssign, onRevoke, factory)
+
+    val factory = new SubSourceStageLogicFactory[K, V, ConsumerRecord[K, V]] {
+      def create(
+          shape: SourceShape[ConsumerRecord[K, V]],
+          tp: TopicPartition,
+          consumerActor: ActorRef,
+          subSourceStartedCb: AsyncCallback[(TopicPartition, (Control, ActorRef))],
+          subSourceCancelledCb: AsyncCallback[(TopicPartition, Option[ConsumerRecord[K, V]])],
+          actorNumber: Int
+      ): SubSourceStageLogic[K, V, ConsumerRecord[K, V]] =
+        new SubSourceStageLogic(shape, tp, consumerActor, subSourceStartedCb, subSourceCancelledCb, actorNumber)
+        with PlainMessageBuilder[K, V]
+    }
+
+    new SubSourceLogic[K, V, ConsumerRecord[K, V]](shape,
+                                                   settings,
+                                                   subscription,
+                                                   getOffsetsOnAssign,
+                                                   onRevoke,
+                                                   subSourceStageLogicFactory = factory)
   }
 }
