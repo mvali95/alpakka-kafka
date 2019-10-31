@@ -376,7 +376,24 @@ class ProducerSpec(_system: ActorSystem)
     }
   }
 
-  it should "not initialize a transaction when there are no messages" in {
+  it should "not initialize and begin transaction when there are no messages" in {
+    assertAllStagesStopped {
+      val client = new ProducerMock[K, V](ProducerMock.handlers.fail)
+
+      val probe = Source
+        .empty[Msg]
+        .via(testTransactionProducerFlow(client))
+        .runWith(TestSink.probe)
+
+      probe
+        .request(1)
+        .expectComplete()
+
+      client.verifyNoMoreInteractions()
+    }
+  }
+
+  it should "initialize and begin a transaction when first run" in {
     assertAllStagesStopped {
       val input = recordAndMetadata(1)
 
@@ -396,30 +413,10 @@ class ProducerSpec(_system: ActorSystem)
       source.sendNext(txMsg)
       sink.requestNext()
 
-      // we must wait for the producer to be asynchronously assigned before observing interactions with the mock
-      awaitAssert(client.verifyTxInitialized())
+      awaitAssert(client.verifyTxInitialized(), 2.second)
 
       source.sendComplete()
       sink.expectComplete()
-
-      client.verifyNoMoreInteractions()
-    }
-  }
-
-  it should "initialize and begin a transaction when first run" in {
-    assertAllStagesStopped {
-      val client = new ProducerMock[K, V](ProducerMock.handlers.fail)
-
-      val probe = Source
-        .single(toMessage(recordAndMetadata(1)))
-        .via(testTransactionProducerFlow(client))
-        .runWith(TestSink.probe)
-
-      probe
-        .request(1)
-        .expectError()
-
-      client.verifyTxInitialized()
     }
   }
 
@@ -526,10 +523,14 @@ class ProducerSpec(_system: ActorSystem)
 
     val txMsg = toTxMessage(input, committedMarker.mock)
     source.sendNext(txMsg)
+
+    awaitAssert(client.verifyTxInitialized())
+
     source.sendError(new Exception())
 
     // Here we can not be sure that all messages from source delivered to producer
     // because of buffers in akka-stream and faster error pushing that ignores buffers
+    // TODO: we can await a tx to be initialized before sending the error (which means the producer was assigned and first msg processed). does that invalidate this test?
 
     Await.ready(sink, remainingOrDefault)
     sink.value should matchPattern {

@@ -189,7 +189,9 @@ private final class TransactionalProducerStageLogic[K, V, P](
     val txId = msg.passThrough match {
       case committedMarker: PartitionOffsetCommittedMarker if committedMarker.fromPartitionedSource =>
         val gtp = committedMarker.key
-        s"$transactionalId-${gtp.groupId}-${gtp.topic}-${gtp.partition}"
+        val txId = s"$transactionalId-${gtp.groupId}-${gtp.topic}-${gtp.partition}"
+        log.debug("Generated transactional id from partitioned source ''", txId)
+        txId
       case _ => transactionalId
     }
 

@@ -40,10 +40,8 @@ private[kafka] final class TransactionalSource[K, V](consumerSettings: ConsumerS
   override protected def logic(shape: SourceShape[TransactionalMessage[K, V]]): GraphStageLogic with Control =
     new TransactionalSourceLogic(shape, TransactionalSource.txConsumerSettings(consumerSettings), subscription)
     with TransactionalMessageBuilder[K, V] {
-      // TODO check that this is valid
       override val fromPartitionedSource: Boolean = false
     }
-
 }
 
 /** Internal API */
