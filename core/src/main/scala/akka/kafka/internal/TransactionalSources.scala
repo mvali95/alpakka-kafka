@@ -270,6 +270,8 @@ private[kafka] final class TransactionalSubSource[K, V](
 /** Internal API */
 @InternalApi
 private object TransactionalSourceLogic {
+  type Offset = Long
+
   case object Drained
   case class Drain[T](partitions: Set[TopicPartition],
                       drainedConfirmationRef: Option[ActorRef],
@@ -290,8 +292,6 @@ private object TransactionalSourceLogic {
     override def failed(): Unit =
       sourceActor ! CommittingFailure
   }
-
-  type Offset = Long
 
   private[internal] trait InFlightRecords {
     // Assumes that offsets per topic partition are added in the increasing order

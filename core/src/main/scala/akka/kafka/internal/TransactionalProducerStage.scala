@@ -132,12 +132,13 @@ private final class TransactionalProducerStageLogic[K, V, P](
     scheduleOnce(commitSchedulerKey, stage.settings.eosCommitInterval)
   }
 
-  private def produceFirstMessage(): Unit =
-    firstMessage = firstMessage.flatMap { msg =>
-      // produce first message before resuming demand
+  private def produceFirstMessage(): Unit = firstMessage match {
+    case Some(msg) =>
       produce(msg)
-      None
-    }
+      firstMessage = None
+    case _ =>
+      throw new IllegalStateException("Should never attempt to produce first message if it does not exist.")
+  }
 
   override protected def resumeDemand(tryToPull: Boolean = true): Unit = {
     super.resumeDemand(tryToPull)
@@ -171,13 +172,15 @@ private final class TransactionalProducerStageLogic[K, V, P](
     producerAssignmentLifecycle match {
       case Assigned => true
       case Unassigned =>
-        resolveProducer(generatedTransactionalConfig(msg))
         if (firstMessage.nonEmpty) {
           // this should never happen because demand should be suspended until the producer is assigned
           throw new IllegalStateException("Cannot reapply first message")
         }
         // stash the first message so it can be sent after the producer is assigned
         firstMessage = Some(msg)
+        // initiate async async producer request _after_ first message is stashed in case future eagerly resolves
+        // instead of asynccallback
+        resolveProducer(generatedTransactionalConfig(msg))
         // suspend demand after we receive the first message until the producer is assigned
         suspendDemand()
         false
@@ -190,7 +193,7 @@ private final class TransactionalProducerStageLogic[K, V, P](
       case committedMarker: PartitionOffsetCommittedMarker if committedMarker.fromPartitionedSource =>
         val gtp = committedMarker.key
         val txId = s"$transactionalId-${gtp.groupId}-${gtp.topic}-${gtp.partition}"
-        log.debug("Generated transactional id from partitioned source ''", txId)
+        log.debug("Generated transactional id from partitioned source '{}'", txId)
         txId
       case _ => transactionalId
     }
@@ -267,6 +270,6 @@ private final class TransactionalProducerStageLogic[K, V, P](
 
   private def abortTransaction(): Unit = {
     log.debug("Aborting transaction")
-    if (producer != null) producer.abortTransaction()
+    if (producerAssignmentLifecycle == Assigned) producer.abortTransaction()
   }
 }

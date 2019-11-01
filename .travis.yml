@@ -5,11 +5,6 @@ services:
   - docker
 
 before_install:
-  # upgrade to a later docker-compose which supports services.kafka.scale
-  - sudo rm /usr/local/bin/docker-compose
-  - curl -L https://github.com/docker/compose/releases/download/1.22.0/docker-compose-`uname -s`-`uname -m` > docker-compose
-  - chmod +x docker-compose
-  - sudo mv docker-compose /usr/local/bin
   # fetch full history for correct current and previous version detection
   - git fetch --unshallow
   # using jabba for custom jdk management
@@ -25,6 +20,14 @@ script:
 
 jobs:
   include:
+    - stage: debug
+      name: "debug test: must support copy stream with merging and multi message x50"
+      script: sbt "tests/testOnly *.TransactionsSpec -- -z \"must support copy stream with merging and multi message\" -DtimesToRepeat=50"
+    - name: "debug test: must provide consistency when multiple transactional streams are being restarted x10"
+      script: sbt "tests/it:testOnly *.TransactionsSourceSpec -- -z \"must provide consistency when multiple transactional streams are being restarted\" -DtimesToRepeat=10"
+    - name: "debug test: must provide consistency when multiple partitioned transactional streams are being restarted x10"
+      script: sbt "tests/it:testOnly *.TransactionsPartitionedSourceSpec -- -z \"must provide consistency when multiple partitioned transactional streams are being restarted\" -DtimesToRepeat=10"
+
     - stage: check
       script: sbt verifyCodeStyle
       name: "Code style check. Run locally with: sbt verifyCodeStyle"
@@ -80,6 +83,10 @@ jobs:
       name: "Publish API and reference documentation"
 
 stages:
+  # runs on master commits and PRs
+  - name: debug
+    if: NOT tag =~ ^v
+
   # runs on master commits and PRs
   - name: check
     if: NOT tag =~ ^v

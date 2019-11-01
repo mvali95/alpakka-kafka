@@ -239,7 +239,7 @@ private class DefaultProducerStageLogic[K, V, P, IN <: Envelope[K, V, P], OUT <:
   }
 
   private def closeProducer(): Unit =
-    if (stage.settings.closeProducerOnStop && producer != null) {
+    if (stage.settings.closeProducerOnStop && producerAssignmentLifecycle == Assigned) {
       try {
         // we do not have to check if producer was already closed in send-callback as `flush()` and `close()` are effectively no-ops in this case
         producer.flush()

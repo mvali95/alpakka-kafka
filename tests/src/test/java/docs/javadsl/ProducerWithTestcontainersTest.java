@@ -107,7 +107,8 @@ class ProducerWithTestcontainersTest extends TestcontainersKafkaTest {
         Source.range(1, 100)
             .map(number -> number.toString())
             .map(value -> new ProducerRecord<String, String>(topic, value))
-            .runWith(Producer.plainSink(producerSettings, kafkaProducer), materializer);
+            .runWith(
+                Producer.plainSink(producerSettings.withProducer(kafkaProducer)), materializer);
     // #plainSinkWithProducer
 
     Consumer.DrainingControl<List<ConsumerRecord<String, String>>> control =

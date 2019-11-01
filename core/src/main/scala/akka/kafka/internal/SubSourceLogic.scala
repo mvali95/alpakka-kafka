@@ -205,7 +205,7 @@ private class SubSourceLogic[K, V, Msg](
 
   val subsourceStartedCB: AsyncCallback[(TopicPartition, ControlAndStageActor)] =
     getAsyncCallback[(TopicPartition, ControlAndStageActor)] {
-      case (tp, value @ ControlAndStageActor(control, actorRef)) =>
+      case (tp, value @ ControlAndStageActor(control, _)) =>
         if (!partitionsInStartup.contains(tp)) {
           // Partition was revoked while
           // starting up.  Kill!
@@ -371,9 +371,9 @@ private abstract class SubSourceStageLogic[K, V, Msg](
     super.preStart()
     subSourceActor = getStageActor(messageHandling)
     subSourceActor.watch(consumerActor)
-    consumerActor.tell(RegisterSubStage, subSourceActor.ref)
     val controlAndActor = ControlAndStageActor(this.asInstanceOf[Control], subSourceActor.ref)
     subSourceStartedCb.invoke(tp -> controlAndActor)
+    consumerActor.tell(RegisterSubStage, subSourceActor.ref)
   }
 
   protected def messageHandling: PartialFunction[(ActorRef, Any), Unit] = {
