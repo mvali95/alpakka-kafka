@@ -187,19 +187,25 @@ private class SubSourceLogic[K, V, Msg](
       partitionsToRevoke = Set.empty
   }
 
-  val subsourceCancelledCB: AsyncCallback[(TopicPartition, Option[ConsumerRecord[K, V]])] =
-    getAsyncCallback[(TopicPartition, Option[ConsumerRecord[K, V]])] {
-      case (tp, firstUnconsumed) =>
+  val subsourceCancelledCB: AsyncCallback[(TopicPartition, SubSourceCancellationStrategy)] =
+    getAsyncCallback[(TopicPartition, SubSourceCancellationStrategy)] {
+      case (tp, cancellationStrategy: SubSourceCancellationStrategy) =>
         subSources -= tp
         partitionsInStartup -= tp
-        pendingPartitions += tp
-        firstUnconsumed match {
-          case Some(record) =>
+
+        cancellationStrategy match {
+          case SeekToOffsetAndReEmit(offset) =>
+            // re-add this partition to pending partitions so it can be re-emitted
+            pendingPartitions += tp
             if (log.isDebugEnabled) {
-              log.debug("#{} Seeking {} to {} after partition SubSource cancelled", actorNumber, tp, record.offset())
+              log.debug("#{} Seeking {} to {} after partition SubSource cancelled", actorNumber, tp, offset)
             }
-            seekAndEmitSubSources(formerlyUnknown = Set.empty, Map(tp -> record.offset()))
-          case None => emitSubSourcesForPendingPartitions()
+            seekAndEmitSubSources(formerlyUnknown = Set.empty, Map(tp -> offset))
+          case ReEmit =>
+            // re-add this partition to pending partitions so it can be re-emitted
+            pendingPartitions += tp
+            emitSubSourcesForPendingPartitions()
+          case DoNothing =>
         }
     }
 
@@ -216,12 +222,14 @@ private class SubSourceLogic[K, V, Msg](
         }
     }
 
-  setHandler(shape.out, new OutHandler {
-    override def onPull(): Unit =
-      emitSubSourcesForPendingPartitions()
-    override def onDownstreamFinish(): Unit =
-      performShutdown()
-  })
+  setHandler(
+    shape.out,
+    new OutHandler {
+      override def onPull(): Unit =
+        emitSubSourcesForPendingPartitions()
+      override def onDownstreamFinish(): Unit = performShutdown()
+    }
+  )
 
   private def updatePendingPartitionsAndEmitSubSources(formerlyUnknownPartitions: Set[TopicPartition]): Unit = {
     pendingPartitions ++= formerlyUnknownPartitions.filter(!partitionsInStartup.contains(_))
@@ -268,7 +276,6 @@ private class SubSourceLogic[K, V, Msg](
     subSources.foreach {
       case (_, ControlAndStageActor(control, _)) => control.shutdown()
     }
-
     if (!isClosed(shape.out)) {
       complete(shape.out)
     }
@@ -305,7 +312,7 @@ private final class SubSourceStage[K, V, Msg](
     tp: TopicPartition,
     consumerActor: ActorRef,
     subSourceStartedCb: AsyncCallback[(TopicPartition, ControlAndStageActor)],
-    subSourceCancelledCb: AsyncCallback[(TopicPartition, Option[ConsumerRecord[K, V]])],
+    subSourceCancelledCb: AsyncCallback[(TopicPartition, SubSourceCancellationStrategy)],
     actorNumber: Int,
     subSourceStageLogicFactory: SubSourceStageLogicFactory[K, V, Msg]
 ) extends GraphStage[SourceShape[Msg]] { stage =>
@@ -324,6 +331,11 @@ private final class SubSourceStage[K, V, Msg](
 @InternalApi
 private final case class ControlAndStageActor(control: Control, stageActor: ActorRef)
 
+sealed trait SubSourceCancellationStrategy
+final case class SeekToOffsetAndReEmit(offset: Long) extends SubSourceCancellationStrategy
+case object ReEmit extends SubSourceCancellationStrategy
+case object DoNothing extends SubSourceCancellationStrategy
+
 /** Internal API
  *
  * Encapsulates a factory method to create a `SubSourceStageLogic` within `SubSourceLogic` where the context
@@ -336,7 +348,7 @@ private trait SubSourceStageLogicFactory[K, V, Msg] {
       tp: TopicPartition,
       consumerActor: ActorRef,
       subSourceStartedCb: AsyncCallback[(TopicPartition, ControlAndStageActor)],
-      subSourceCancelledCb: AsyncCallback[(TopicPartition, Option[ConsumerRecord[K, V]])],
+      subSourceCancelledCb: AsyncCallback[(TopicPartition, SubSourceCancellationStrategy)],
       actorNumber: Int
   ): SubSourceStageLogic[K, V, Msg]
 }
@@ -352,7 +364,7 @@ private abstract class SubSourceStageLogic[K, V, Msg](
     tp: TopicPartition,
     consumerActor: ActorRef,
     subSourceStartedCb: AsyncCallback[(TopicPartition, ControlAndStageActor)],
-    subSourceCancelledCb: AsyncCallback[(TopicPartition, Option[ConsumerRecord[K, V]])],
+    subSourceCancelledCb: AsyncCallback[(TopicPartition, SubSourceCancellationStrategy)],
     actorNumber: Int
 ) extends GraphStageLogic(shape)
     with PromiseControl
@@ -392,6 +404,13 @@ private abstract class SubSourceStageLogic[K, V, Msg](
       failStage(new ConsumerFailed)
   }
 
+  protected def onDownstreamFinishSubSourceCancellationStrategy(): SubSourceCancellationStrategy =
+    if (buffer.hasNext) {
+      SeekToOffsetAndReEmit(buffer.next().offset())
+    } else {
+      ReEmit
+    }
+
   override def postStop(): Unit = {
     onShutdown()
     super.postStop()
@@ -404,13 +423,7 @@ private abstract class SubSourceStageLogic[K, V, Msg](
         pump()
 
       override def onDownstreamFinish(): Unit = {
-        val firstUnconsumed = if (buffer.hasNext) {
-          Some(buffer.next())
-        } else {
-          None
-        }
-
-        subSourceCancelledCb.invoke(tp -> firstUnconsumed)
+        subSourceCancelledCb.invoke(tp -> onDownstreamFinishSubSourceCancellationStrategy())
         super.onDownstreamFinish()
       }
     }

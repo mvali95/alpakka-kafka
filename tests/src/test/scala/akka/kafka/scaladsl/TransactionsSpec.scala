@@ -5,6 +5,8 @@
 
 package akka.kafka.scaladsl
 
+import java.util.concurrent.atomic.AtomicBoolean
+
 import akka.Done
 import akka.kafka.ConsumerMessage.PartitionOffset
 import akka.kafka.scaladsl.Consumer.Control
@@ -12,8 +14,8 @@ import akka.kafka.testkit.scaladsl.TestcontainersKafkaLike
 import akka.kafka.{ProducerMessage, _}
 import akka.stream.scaladsl.{Keep, RestartSource, Sink}
 import akka.stream.testkit.scaladsl.StreamTestKit.assertAllStagesStopped
-import akka.stream.testkit.scaladsl.TestSink
 import org.apache.kafka.clients.producer.ProducerRecord
+import org.scalatest.RecoverMethods._
 
 import scala.collection.immutable
 import scala.concurrent.duration._
@@ -47,56 +49,6 @@ class TransactionsSpec extends SpecBase with TestcontainersKafkaLike with Transa
 
         probeConsumer.cancel()
         Await.result(control.shutdown(), remainingOrDefault)
-      }
-    }
-
-    "complete with partitioned source" in {
-      assertAllStagesStopped {
-        val maxPartitions = 2
-        val sourceTopic = createTopic(1, maxPartitions, 1)
-        val sinkTopic = createTopic(2)
-        val group = createGroupId(1)
-        val transactionalId = createTransactionalId()
-
-        Await.result(produce(sourceTopic, 1 to 100), remainingOrDefault)
-
-        val consumerSettings = consumerDefaults.withGroupId(group)
-
-        def runTransactional =
-          Transactional
-            .partitionedSource(consumerSettings, Subscriptions.topics(sourceTopic))
-            .mapAsyncUnordered(maxPartitions) {
-              case (_, source) =>
-                source
-                  .map { msg =>
-                    ProducerMessage.single(new ProducerRecord[String, String](sinkTopic, msg.record.value),
-                                           msg.partitionOffset)
-                  }
-                  .runWith(Transactional.sink(producerDefaults, transactionalId))
-            }
-            .toMat(Sink.ignore)(Keep.left)
-            .run()
-
-        val control = runTransactional
-
-        val control2 = runTransactional
-
-        Await.result(produce(sourceTopic, 101 to 200), remainingOrDefault)
-
-        val probeConsumerGroup = createGroupId(2)
-
-        val probeConsumer = Consumer
-          .plainSource(probeConsumerSettings(probeConsumerGroup), Subscriptions.topics(sourceTopic))
-          .map(_.value())
-          .runWith(TestSink.probe)
-
-        probeConsumer
-          .request(200)
-          .expectNextN((1 to 200).map(_.toString))
-
-        probeConsumer.cancel()
-        Await.result(control.shutdown(), remainingOrDefault)
-        Await.result(control2.shutdown(), remainingOrDefault)
       }
     }
 
@@ -337,9 +289,149 @@ class TransactionsSpec extends SpecBase with TestcontainersKafkaLike with Transa
       concatsConsumer.cancel()
       Await.result(control.shutdown(), remainingOrDefault)
     }
+
+    "complete partitioned source in happy-path scenario" in {
+      assertAllStagesStopped {
+        val elements = 200
+        val maxPartitions = 2
+        val sourceTopic = createTopic(1, maxPartitions)
+        val sinkTopic = createTopic(2, maxPartitions)
+        val group = createGroupId(1)
+        val transactionalId = createTransactionalId()
+
+        val consumerSettings = consumerDefaults.withGroupId(group)
+
+        def runTransactional =
+          Transactional
+            .partitionedSource(consumerSettings, Subscriptions.topics(sourceTopic))
+            .mapAsyncUnordered(maxPartitions) {
+              case (_, source) =>
+                source
+                  .map { msg =>
+                    ProducerMessage.single(new ProducerRecord[String, String](sinkTopic,
+                                                                              msg.record.partition(),
+                                                                              msg.record.key(),
+                                                                              msg.record.value),
+                                           msg.partitionOffset)
+                  }
+                  .runWith(Transactional.sink(producerDefaults, transactionalId))
+            }
+            .toMat(Sink.ignore)(Keep.left)
+            .run()
+
+        val control = runTransactional
+        val control2 = runTransactional
+
+        waitUntilConsumerSummary(group) {
+          case consumer1 :: consumer2 :: Nil =>
+            val half = maxPartitions / 2
+            consumer1.assignment.topicPartitions.size == half && consumer2.assignment.topicPartitions.size == half
+        }
+
+        val testProducerSettings = producerDefaults.withProducer(testProducer)
+        Await.result(
+          produceToAllPartitions(testProducerSettings, sourceTopic, maxPartitions, 1 to elements),
+          remainingOrDefault
+        )
+
+        val consumer = consumePartitionOffsetValues(
+          probeConsumerSettings(createGroupId(2)),
+          sinkTopic,
+          elementsToTake = (elements * maxPartitions).toLong
+        )
+
+        val actualValues: immutable.Seq[(Int, Long, String)] = Await.result(consumer, 60.seconds)
+        assertPartitionedConsistency(elements, maxPartitions, actualValues)
+
+        Await.result(control.shutdown(), remainingOrDefault)
+        Await.result(control2.shutdown(), remainingOrDefault)
+      }
+    }
+
+    "complete partitioned source with a sub source failure and rebalance of partitions to second instance" in {
+      assertAllStagesStopped {
+        val elements = 200
+        val maxPartitions = 2
+        val sourceTopic = createTopic(1, maxPartitions)
+        val sinkTopic = createTopic(2, maxPartitions)
+        val group = createGroupId(1)
+        val transactionalId = createTransactionalId()
+
+        val testProducerSettings = producerDefaults.withProducer(testProducer)
+        val consumerSettings = consumerDefaults
+          .withGroupId(group)
+          .withStopTimeout(0.millis) // time to wait to schedule Stop to be sent to consumer actor
+          .withCloseTimeout(0.millis) // timeout while waiting for KafkaConsumer.close
+
+        val failureOccurred = new AtomicBoolean()
+
+        def runTransactional(): (Control, Future[Done]) =
+          Transactional
+            .partitionedSource(consumerSettings, Subscriptions.topics(sourceTopic))
+            .mapAsyncUnordered(maxPartitions) {
+              case (tp, source) =>
+                source
+                  .map { msg =>
+                    if (tp.partition() == 1 && msg.record.value.toInt == elements / 2 && !failureOccurred.get()) {
+                      failureOccurred.set(true)
+                      throw new Exception("sub source failure")
+                    }
+                    ProducerMessage.single(new ProducerRecord[String, String](sinkTopic,
+                                                                              msg.record.partition(),
+                                                                              msg.record.key(),
+                                                                              msg.record.value),
+                                           msg.partitionOffset)
+                  }
+                  .runWith(Transactional.sink(producerDefaults, transactionalId))
+            }
+            .toMat(Sink.ignore)(Keep.both)
+            .run()
+
+        log.info("Running 2 transactional workloads with prefix transactional id: {}", transactionalId)
+        val (control1, streamResult1) = runTransactional()
+        val (control2, streamResult2) = runTransactional()
+
+        log.info("Waiting until partitions are assigned across both consumers")
+        waitUntilConsumerSummary(group) {
+          case consumer1 :: consumer2 :: Nil =>
+            val half = maxPartitions / 2
+            consumer1.assignment.topicPartitions.size == half && consumer2.assignment.topicPartitions.size == half
+        }
+
+        log.info("Seeding topic with '{}' elements for all partitions ({})", elements, maxPartitions)
+        Await.result(produceToAllPartitions(testProducerSettings, sourceTopic, maxPartitions, 1 to elements),
+                     remainingOrDefault)
+
+        val consumer = consumePartitionOffsetValues(
+          probeConsumerSettings(createGroupId(2)),
+          sinkTopic,
+          elementsToTake = (elements * maxPartitions).toLong
+        )
+
+        log.info("Retrieve actual values")
+        val actualValues: immutable.Seq[(Int, Long, String)] = Await.result(consumer, 60.seconds)
+
+        log.info("Waiting until partitions are assigned to one non-failed consumer")
+        waitUntilConsumerSummary(group) {
+          case singleConsumer :: Nil => singleConsumer.assignment.topicPartitions.size == maxPartitions
+        }
+
+        log.info("Assert that one of the stream results has failed")
+        if (streamResult1.isCompleted)
+          recoverToSucceededIf[Exception](streamResult1)
+        else if (streamResult2.isCompleted)
+          recoverToSucceededIf[Exception](streamResult2)
+        else fail("Expected one of the stream results to have failed")
+
+        assertPartitionedConsistency(elements, maxPartitions, actualValues)
+
+        Await.result(control1.shutdown(), remainingOrDefault)
+        Await.result(control2.shutdown(), remainingOrDefault)
+      }
+    }
   }
 
-  private def probeConsumerSettings(groupId: String): ConsumerSettings[String, String] =
+  def probeConsumerSettings(groupId: String): ConsumerSettings[String, String] =
     withProbeConsumerSettings(consumerDefaults, groupId)
 
   override def producerDefaults: ProducerSettings[String, String] =

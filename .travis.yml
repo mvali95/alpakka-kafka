@@ -21,8 +21,8 @@ script:
 jobs:
   include:
     - stage: debug
-      name: "debug test: must support copy stream with merging and multi message x50"
-      script: sbt "tests/testOnly *.TransactionsSpec -- -z \"must support copy stream with merging and multi message\" -DtimesToRepeat=50"
+      name: "debug test: TransactionsSpec x50"
+      script: sbt "tests/testOnly *.TransactionsSpec -DtimesToRepeat=50"
     - name: "debug test: must provide consistency when multiple transactional streams are being restarted x10"
       script: sbt "tests/it:testOnly *.TransactionsSourceSpec -- -z \"must provide consistency when multiple transactional streams are being restarted\" -DtimesToRepeat=10"
     - name: "debug test: must provide consistency when multiple partitioned transactional streams are being restarted x10"

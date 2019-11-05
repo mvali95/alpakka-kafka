@@ -110,7 +110,7 @@ private[kafka] final class CommittableSubSource[K, V](
           tp: TopicPartition,
           consumerActor: ActorRef,
           subSourceStartedCb: AsyncCallback[(TopicPartition, ControlAndStageActor)],
-          subSourceCancelledCb: AsyncCallback[(TopicPartition, Option[ConsumerRecord[K, V]])],
+          subSourceCancelledCb: AsyncCallback[(TopicPartition, SubSourceCancellationStrategy)],
           actorNumber: Int
       ): SubSourceStageLogic[K, V, CommittableMessage[K, V]] =
         new CommittableSubSourceStageLogic(shape,
@@ -214,7 +214,7 @@ private class CommittableSubSourceStageLogic[K, V](
     tp: TopicPartition,
     consumerActor: ActorRef,
     subSourceStartedCb: AsyncCallback[(TopicPartition, ControlAndStageActor)],
-    subSourceCancelledCb: AsyncCallback[(TopicPartition, Option[ConsumerRecord[K, V]])],
+    subSourceCancelledCb: AsyncCallback[(TopicPartition, SubSourceCancellationStrategy)],
     actorNumber: Int,
     consumerSettings: ConsumerSettings[K, V],
     _metadataFromRecord: ConsumerRecord[K, V] => String = CommittableMessageBuilder.NoMetadataFromRecord

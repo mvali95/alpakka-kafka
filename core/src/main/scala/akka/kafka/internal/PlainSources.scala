@@ -58,11 +58,15 @@ private[kafka] final class PlainSubSource[K, V](
           tp: TopicPartition,
           consumerActor: ActorRef,
           subSourceStartedCb: AsyncCallback[(TopicPartition, ControlAndStageActor)],
-          subSourceCancelledCb: AsyncCallback[(TopicPartition, Option[ConsumerRecord[K, V]])],
+          subSourceCancelledCb: AsyncCallback[(TopicPartition, SubSourceCancellationStrategy)],
           actorNumber: Int
       ): SubSourceStageLogic[K, V, ConsumerRecord[K, V]] =
-        new SubSourceStageLogic(shape, tp, consumerActor, subSourceStartedCb, subSourceCancelledCb, actorNumber)
-        with PlainMessageBuilder[K, V]
+        new SubSourceStageLogic[K, V, ConsumerRecord[K, V]](shape,
+                                                            tp,
+                                                            consumerActor,
+                                                            subSourceStartedCb,
+                                                            subSourceCancelledCb,
+                                                            actorNumber) with PlainMessageBuilder[K, V]
     }
 
     new SubSourceLogic[K, V, ConsumerRecord[K, V]](shape,

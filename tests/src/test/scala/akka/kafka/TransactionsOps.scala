@@ -4,23 +4,25 @@
  */
 
 package akka.kafka
-import akka.NotUsed
+import akka.{Done, NotUsed}
 import akka.actor.ActorSystem
 import akka.kafka.ConsumerMessage.PartitionOffset
+import akka.kafka.ProducerMessage.MultiMessage
 import akka.kafka.scaladsl.Consumer.Control
-import akka.kafka.scaladsl.{Consumer, Transactional}
+import akka.kafka.scaladsl.{Consumer, Producer, Transactional}
 import akka.stream.Materializer
-import akka.stream.scaladsl.Source
+import akka.stream.scaladsl.{Flow, Sink, Source}
 import akka.stream.testkit.TestSubscriber
 import akka.stream.testkit.scaladsl.TestSink
 import org.apache.kafka.clients.consumer.ConsumerConfig
 import org.apache.kafka.clients.producer.{ProducerConfig, ProducerRecord}
-import org.scalatest.TestSuite
+import org.scalatest.{Matchers, TestSuite}
 
 import scala.collection.immutable
-import scala.concurrent.duration.{Duration, FiniteDuration}
+import scala.concurrent.Future
+import scala.concurrent.duration._
 
-trait TransactionsOps extends TestSuite {
+trait TransactionsOps extends TestSuite with Matchers {
   def transactionalCopyStream(
       consumerSettings: ConsumerSettings[String, String],
       producerSettings: ProducerSettings[String, String],
@@ -45,6 +47,9 @@ trait TransactionsOps extends TestSuite {
       }
       .via(Transactional.flow(producerSettings, transactionalId))
 
+  /**
+   * Copy messages from a source to sink topic. Source and sink must have exactly the same number of partitions.
+   */
   def transactionalPartitionedCopyStream(
       consumerSettings: ConsumerSettings[String, String],
       producerSettings: ProducerSettings[String, String],
@@ -70,13 +75,28 @@ trait TransactionsOps extends TestSuite {
               }
               .idleTimeout(idleTimeout)
               .map { msg =>
-                ProducerMessage.single(new ProducerRecord[String, String](sinkTopic, msg.record.value),
+                ProducerMessage.single(new ProducerRecord[String, String](sinkTopic,
+                                                                          msg.record.partition(),
+                                                                          msg.record.key(),
+                                                                          msg.record.value),
                                        msg.partitionOffset)
               }
               .via(Transactional.flow(producerSettings, transactionalId))
             results
         }
       )
+
+  def produceToAllPartitions(producerSettings: ProducerSettings[String, String],
+                             topic: String,
+                             partitions: Int,
+                             range: Range)(implicit mat: Materializer): Future[Done] =
+    Source(range)
+      .map { n =>
+        val msgs = (0 until partitions).map(p => new ProducerRecord(topic, p, n.toString, n.toString))
+        MultiMessage(msgs, n)
+      }
+      .via(Producer.flexiFlow(producerSettings))
+      .runWith(Sink.ignore)
 
   def checkForDuplicates(values: immutable.Seq[(Long, String)], expected: immutable.IndexedSeq[String]): Unit =
     withClue("Checking for duplicates: ") {
@@ -133,6 +153,45 @@ trait TransactionsOps extends TestSuite {
     Consumer
       .plainSource(settings, Subscriptions.topics(topic))
       .map(r => (r.offset(), r.value()))
+
+  def consumePartitionOffsetValues(settings: ConsumerSettings[String, String], topic: String, elementsToTake: Long)(
+      implicit mat: Materializer
+  ): Future[immutable.Seq[(Int, Long, String)]] =
+    Consumer
+      .plainSource(settings, Subscriptions.topics(topic))
+      .map(r => (r.partition(), r.offset(), r.value()))
+      .take(elementsToTake)
+      .idleTimeout(30.seconds)
+      .alsoTo(
+        Flow[(Int, Long, String)]
+          .scan(0) { case (count, _) => count + 1 }
+          .filter(_ % 100 == 0)
+          .log("received")
+          .to(Sink.ignore)
+      )
+      .recover {
+        case t => (0, 0L, "no-more-elements")
+      }
+      .filter(_._3 != "no-more-elements")
+      .runWith(Sink.seq)
+
+  def assertPartitionedConsistency(
+      elements: Int,
+      maxPartitions: Int,
+      values: immutable.Seq[(Int, Long, String)]
+  ): Unit = {
+    val expectedValues: immutable.Seq[String] = (1 to elements).map(_.toString)
+
+    for (partition <- 0 until maxPartitions) {
+      println(s"Asserting values for partition: $partition")
+
+      val partitionMessages: immutable.Seq[String] =
+        values.filter(_._1 == partition).map { case (_, _, value) => value }
+
+      assert(partitionMessages.length == elements)
+      expectedValues should contain theSameElementsInOrderAs partitionMessages
+    }
+  }
 
   def withProbeConsumerSettings(settings: ConsumerSettings[String, String],
                                 groupId: String): ConsumerSettings[String, String] =

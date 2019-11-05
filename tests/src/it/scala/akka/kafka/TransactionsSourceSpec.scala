@@ -113,7 +113,7 @@ class TransactionsSourceSpec extends SpecBase
 
       val expected = (1 to elements).map(_.toString)
 
-      log.debug("Expected elements: {}, actual elements: {}", elements, values.length)
+      log.info("Expected elements: {}, actual elements: {}", elements, values.length)
 
       checkForMissing(values, expected)
       checkForDuplicates(values, expected)

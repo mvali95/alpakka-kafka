@@ -215,7 +215,7 @@ private[kafka] final class TransactionalSubSource[K, V](
           tp: TopicPartition,
           consumerActor: ActorRef,
           subSourceStartedCb: AsyncCallback[(TopicPartition, ControlAndStageActor)],
-          subSourceCancelledCb: AsyncCallback[(TopicPartition, Option[ConsumerRecord[K, V]])],
+          subSourceCancelledCb: AsyncCallback[(TopicPartition, SubSourceCancellationStrategy)],
           actorNumber: Int
       ): SubSourceStageLogic[K, V, TransactionalMessage[K, V]] =
         new TransactionalSubSourceStageLogic(shape,
@@ -341,11 +341,17 @@ private class TransactionalSubSourceStageLogic[K, V](
     tp: TopicPartition,
     consumerActor: ActorRef,
     subSourceStartedCb: AsyncCallback[(TopicPartition, ControlAndStageActor)],
-    subSourceCancelledCb: AsyncCallback[(TopicPartition, Option[ConsumerRecord[K, V]])],
+    subSourceCancelledCb: AsyncCallback[(TopicPartition, SubSourceCancellationStrategy)],
     actorNumber: Int,
     consumerSettings: ConsumerSettings[K, V]
-) extends SubSourceStageLogic(shape, tp, consumerActor, subSourceStartedCb, subSourceCancelledCb, actorNumber)
+) extends SubSourceStageLogic[K, V, TransactionalMessage[K, V]](shape,
+                                                                  tp,
+                                                                  consumerActor,
+                                                                  subSourceStartedCb,
+                                                                  subSourceCancelledCb,
+                                                                  actorNumber)
     with TransactionalMessageBuilder[K, V] {
+
   import TransactionalSourceLogic._
 
   val inFlightRecords = InFlightRecords.empty
@@ -363,6 +369,8 @@ private class TransactionalSubSourceStageLogic[K, V](
         inFlightRecords.revoke(tps.toSet)
     }
 
+  override protected def onDownstreamFinishSubSourceCancellationStrategy(): SubSourceCancellationStrategy = DoNothing
+
   def shuttingDownReceive: PartialFunction[(ActorRef, Any), Unit] =
     drainHandling
       .orElse {
@@ -373,9 +381,10 @@ private class TransactionalSubSourceStageLogic[K, V](
       }
 
   override def performShutdown(): Unit = {
+    log.debug("#{} Completing SubSource for partition {}", actorNumber, tp)
     setKeepGoing(true)
     if (!isClosed(shape.out)) {
-      complete(shape.out)
+      complete(shape.out) // initiate shutdown of SubSource
     }
     subSourceActor.become(shuttingDownReceive)
     drainAndComplete()
